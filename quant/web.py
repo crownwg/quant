@@ -6,11 +6,14 @@
 from __future__ import annotations
 
 import json
+import math
 import os
+import re
 import subprocess
 import uuid
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse
@@ -52,6 +55,11 @@ class RunParams(BaseModel):
     fw_train: float = Field(2.0, description="训练窗（年）")
     fw_test: float = Field(0.5, description="测试窗（年）")
     grid_timing: str = Field("", description="扫择时模式，如 off,ma,dual；留空则不扫")
+
+    # ----- 调仓清单（实盘用）-----
+    holdings_text: str = Field(
+        "", description="持仓，每行『代码,股数』；留空则用项目里的 my_holdings.csv")
+    plan_date: str = Field("", description="清单基准日 YYYYMMDD，留空 = 回测区间最后一天")
 
 
 # ----- 路由 -----
@@ -95,11 +103,51 @@ async def download(filename: str) -> FileResponse:
     return FileResponse(fp, media_type="text/csv; charset=utf-8", filename=fp.name)
 
 
-def _build_cmd(p: RunParams, prefix: str) -> list[str]:
+def _materialize_holdings(text: str, prefix: str) -> tuple[str | None, str]:
+    """把持仓文本落成 CLI 需要的 CSV 文件，返回 (路径, 来源说明)。
+
+    文本为空时回落到项目根目录的 `my_holdings.csv`——用户什么都不填也能直接出清单。
+    解析故意宽容：逗号/空格/分号/制表符都能当分隔符、允许 `#` 注释行、
+    代码不足 6 位自动补零（用户很可能直接粘「600519 100」过来）。
+    """
+    raw = (text or "").strip()
+    if not raw:
+        default = ROOT / "my_holdings.csv"
+        if default.exists():
+            return str(default), "项目自带的 my_holdings.csv"
+        return None, ""
+
+    rows: list[dict] = []
+    for line in raw.splitlines():
+        line = line.split("#")[0].strip()
+        if not line:
+            continue
+        parts = [x for x in re.split(r"[,\s;，、\t]+", line) if x]
+        if len(parts) < 2 or not parts[0].isdigit():
+            continue
+        try:
+            shares = int(float(parts[1]))
+        except ValueError:
+            continue
+        if shares <= 0:
+            continue
+        rows.append({"code": parts[0].zfill(6), "shares": shares})
+    if not rows:
+        return None, ""
+    path = ROOT / f"{prefix}holdings.csv"
+    pd.DataFrame(rows).to_csv(path, index=False)
+    return str(path), f"页面填写的 {len(rows)} 只持仓"
+
+
+def _build_cmd(p: RunParams, prefix: str, plan_only: bool = False,
+               holdings_path: str | None = None) -> list[str]:
     """把表单参数翻译成 quant.main 的命令行。
 
     独立成函数是为了可被单测覆盖——参数名拼错在页面上只表现为「结果不对」，
     不看命令行很难发现。
+
+    plan_only=True 时只生成调仓清单：main.py 的 holdings 分支是独立 return 的
+    （不会产出净值曲线），所以清单与完整回测不能在同一次调用里兼得。
     """
     cmd = [
         str(PYTHON), "-m", "quant.main",
@@ -154,6 +202,12 @@ def _build_cmd(p: RunParams, prefix: str) -> list[str]:
         gt = (p.grid_timing or "").strip() or "off,ma,momentum,dual"
         cmd += ["--grid-timing", gt]
 
+    # --- 调仓清单 ---
+    if plan_only and holdings_path:
+        cmd += ["--holdings", holdings_path]
+        if (p.plan_date or "").strip():
+            cmd += ["--today", p.plan_date.strip()]
+
     return cmd
 
 
@@ -189,16 +243,110 @@ async def run_backtest(p: RunParams) -> dict:
         return {"error": f"结果解析失败: {exc}"}
 
 
+@app.post("/api/plan")
+async def run_plan(p: RunParams) -> dict:
+    """只生成「今日调仓清单」：按实际持仓算出该买 / 该卖多少股。
+
+    单独做一个入口而不是回测里的勾选项 —— main.py 的 holdings 分支会直接
+    return，不产出净值曲线，两者没法在同一次调用里兼得。
+    """
+    if not PYTHON.exists():
+        raise HTTPException(500, f"找不到 venv 解释器: {PYTHON}")
+    if not p.pool.strip() and not p.codes.strip():
+        raise HTTPException(400, "必须填写「股票池」或「手动代码」其中之一")
+
+    prefix = f"web_{uuid.uuid4().hex[:8]}_"
+    hold_path, hold_src = _materialize_holdings(p.holdings_text, prefix)
+    if hold_path is None:
+        raise HTTPException(400, "持仓格式无法识别：每行写「代码,股数」，例如 600519,100")
+
+    cmd = _build_cmd(p, prefix, plan_only=True, holdings_path=hold_path)
+
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=900, cwd=str(ROOT),
+            encoding="utf-8", errors="replace",
+        )
+    except subprocess.TimeoutExpired:
+        return {"error": "生成清单超时（>15 分钟），请缩短回测区间。"}
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"启动失败: {exc}"}
+
+    if proc.returncode != 0:
+        tail = (proc.stderr or proc.stdout or "").strip()[-1500:]
+        return {"error": f"退出码 {proc.returncode}\n{tail}"}
+
+    try:
+        res = _parse_results(prefix, cmd)
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"结果解析失败: {exc}"}
+
+    # 取不到价格的持仓（通常是池外股票）：main.py 会打印一行告警，这里捞出来单独展示。
+    # 不显示的话，用户会把「不在清单里」误读成「这只不用动」。
+    skipped: list[str] = []
+    m = re.search(r"无法计算[^\n]*?[:：]\s*([0-9、,，\s]+)", proc.stdout or "")
+    if m:
+        skipped = re.findall(r"\d{6}", m.group(1))
+
+    res["mode"] = "plan"
+    res["holding_source"] = hold_src
+    res["skipped"] = skipped
+    res["plan_date"] = (p.plan_date or "").strip() or "回测区间最后一天"
+    return res
+
+
 # ----- 结果解析 -----
+def _json_safe(v):
+    """把单个单元格转成 JSON 能安全序列化的值。
+
+    NaN / Inf → None（否则 FastAPI 抛 Out of range float values）；
+    其余按原类型返回，**不要碰字符串**。
+    """
+    if v is None:
+        return None
+    if isinstance(v, float):
+        return None if (math.isnan(v) or math.isinf(v)) else v
+    if isinstance(v, np.floating):
+        f = float(v)
+        return None if (math.isnan(f) or math.isinf(f)) else f
+    if isinstance(v, np.integer):
+        return int(v)
+    if isinstance(v, np.bool_):
+        return bool(v)
+    if isinstance(v, pd.Timestamp):
+        return v.isoformat()
+    if isinstance(v, (int, str, bool)):
+        return v
+    return str(v)
+
+
+def _read_csv_codes(path: Path) -> pd.DataFrame:
+    """读结果 CSV，并把 code 列强制还原成 6 位字符串。
+
+    pandas 默认会把「全是数字」的列推断成整数：`000858` 进来就是 `858`，
+    页面上股票代码直接少三位、`000001` 变成 `1`。
+    输出端（`_json_safe`）怎么修都没用——数据在这一步就已经错了。
+    """
+    df = pd.read_csv(path)
+    if "code" in df.columns:
+        df["code"] = df["code"].astype(str).str.replace(r"\.0$", "", regex=True).str.zfill(6)
+    return df
+
+
 def _records(df: pd.DataFrame) -> list[dict]:
     """DataFrame → JSON 安全的记录列表。
 
-    不能直接用 to_dict('records')：它会保留 NaN，FastAPI 序列化时抛
-    「Out of range float values are not JSON compliant」。走 to_json 会把 NaN 变成 null。
+    两个坑都要绕开，这里各踩过一次：
+    1. `to_dict('records')` 保留 NaN，FastAPI 序列化时抛
+       「Out of range float values are not JSON compliant」。
+    2. `to_json` 能把 NaN 变成 null，但它**会把「看起来像数字的字符串」列转成数字** ——
+       股票代码 "000858" 变成 858、"002714" 变成 2714，页面上代码就全错了。
+    所以逐格判断类型：只把 NaN/Inf 变 None，字符串原样保留。
     """
     if df is None or len(df) == 0:
         return []
-    return json.loads(df.to_json(orient="records", date_format="iso"))
+    return [{k: _json_safe(v) for k, v in rec.items()}
+            for rec in df.to_dict("records")]
 
 
 def _parse_results(prefix: str, cmd: list | None = None) -> dict:
@@ -251,11 +399,17 @@ def _parse_results(prefix: str, cmd: list | None = None) -> dict:
     exposure = {k: metrics[k] for k in ("avg_exposure", "in_market_ratio",
                                         "exposure_switches") if k in metrics}
 
-    # rebalance plan（调仓清单，有就带上）
+    # rebalance plan（完整周期的调仓计划）
     plan: list[dict] = []
     plan_path = ROOT / f"{prefix}rebalance_plan.csv"
     if plan_path.exists():
-        plan = _records(pd.read_csv(plan_path))
+        plan = _records(_read_csv_codes(plan_path))
+
+    # today_plan（给了 --holdings / --today 才产出：该买/该卖多少股）
+    today_plan: list[dict] = []
+    tp_path = ROOT / f"{prefix}today_plan.csv"
+    if tp_path.exists():
+        today_plan = _records(_read_csv_codes(tp_path))
 
     return {
         "ok": True,
@@ -269,6 +423,7 @@ def _parse_results(prefix: str, cmd: list | None = None) -> dict:
         "monthly": monthly,
         "exposure": exposure,
         "plan": plan,
+        "today_plan": today_plan,
         "prefix": prefix,
         "report_file": f"{prefix}report.html",
         "cmd": cmd or [],

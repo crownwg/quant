@@ -69,7 +69,7 @@
   .panel h2 { margin: 0 0 14px; font-size: 14px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 1px; }
   .field { margin-bottom: 14px; }
   .field label { display: block; margin-bottom: 6px; color: var(--muted); font-size: 12px; }
-  .field input, .field select {
+  .field input, .field select, .field textarea {
     width: 100%;
     padding: 8px 10px;
     background: var(--surface-2);
@@ -79,7 +79,14 @@
     font-size: 13px;
     font-family: inherit;
   }
-  .field input:focus, .field select:focus {
+  .field textarea {
+    resize: vertical;
+    min-height: 84px;
+    line-height: 1.6;
+    font-family: "Cascadia Code", Consolas, monospace;
+    font-size: 12px;
+  }
+  .field input:focus, .field select:focus, .field textarea:focus {
     outline: none;
     border-color: var(--accent);
     box-shadow: 0 0 0 2px rgba(245, 166, 35, 0.15);
@@ -104,6 +111,14 @@
   }
   .btn:hover:not(:disabled) { transform: translateY(-1px); box-shadow: 0 4px 12px rgba(245, 166, 35, 0.3); }
   .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  .btn-alt {
+    background: var(--surface-2);
+    color: var(--accent);
+    border: 1px solid var(--border);
+    font-weight: 600;
+    margin-bottom: 10px;
+  }
+  .btn-alt:hover:not(:disabled) { border-color: var(--accent); box-shadow: none; }
 
   details { margin-bottom: 14px; }
   details summary {
@@ -434,6 +449,29 @@
         </div>
       </details>
 
+      <details id="planBox">
+        <summary>调仓清单 · 我该买/卖多少</summary>
+
+        <div class="field">
+          <label>我的持仓（每行「代码,股数」）</label>
+          <textarea name="holdings_text" id="holdings_text" rows="5"
+                    placeholder="600519,100&#10;000858,1000&#10;002557,500"></textarea>
+        </div>
+
+        <div class="field">
+          <label>清单基准日（留空 = 结束日期）</label>
+          <input type="text" name="plan_date" value="" placeholder="如 20240909">
+        </div>
+
+        <button type="button" class="btn btn-alt" id="planBtn" onclick="onRunPlan()">📋  生成调仓清单</button>
+
+        <div class="meta">
+          留空则用项目里的 <b>my_holdings.csv</b>。<br>
+          要拿能用的清单，先把「结束日期」改成<b>最近交易日</b>——
+          清单是按那个日期算的。
+        </div>
+      </details>
+
       <div class="field check">
         <input type="checkbox" name="use_open" id="use_open" checked>
         <label for="use_open" style="margin: 0">用次日开盘价成交（避免未来函数）</label>
@@ -503,19 +541,14 @@ fetch('/api/health').then(r => r.json()).then(h => {
 }).catch(() => { $('health').textContent = '● 服务离线'; });
 
 /* ----------- 提交 ----------- */
-async function onSubmit(e) {
-  e.preventDefault();
-  const f = e.target;
-  const pool = f.pool.value.trim();
-  const codes = f.codes.value.trim();
-  if (!pool && !codes) { alert('请填写「股票池」或「手动代码」'); return false; }
+function collectParams(f) {
   const num = (name, dflt) => {
     const v = parseFloat(f[name] ? f[name].value : '');
     return isNaN(v) ? dflt : v;
   };
-  const params = {
-    pool: pool,
-    codes: codes,
+  return {
+    pool: f.pool.value.trim(),
+    codes: f.codes.value.trim(),
     strategy: f.strategy.value,
     lookback: parseInt(f.lookback.value),
     top_n: parseInt(f.top_n.value),
@@ -538,13 +571,25 @@ async function onSubmit(e) {
     fw_train: num('fw_train', 2),
     fw_test: num('fw_test', 0.5),
     grid_timing: (f.grid_timing.value || '').trim(),
+    // 调仓清单
+    holdings_text: f.holdings_text.value,
+    plan_date: (f.plan_date.value || '').trim(),
   };
+}
 
-  const tpart = params.timing === 'off'
-    ? '' : ` · 择时 ${params.timing}(${params.timing_lookback})`;
-  const vpart = params.vol_target > 0 ? ` · 波动目标 ${(params.vol_target * 100).toFixed(0)}%` : '';
-  const summary = `${params.pool || params.codes} · ${params.strategy}`
-    + ` · lookback=${params.lookback} · top${params.top_n}${tpart}${vpart}`;
+function paramsSummary(p) {
+  const tpart = p.timing === 'off' ? '' : ` · 择时 ${p.timing}(${p.timing_lookback})`;
+  const vpart = p.vol_target > 0 ? ` · 波动目标 ${(p.vol_target * 100).toFixed(0)}%` : '';
+  return `${p.pool || p.codes} · ${p.strategy}`
+    + ` · lookback=${p.lookback} · top${p.top_n}${tpart}${vpart}`;
+}
+
+async function onSubmit(e) {
+  e.preventDefault();
+  const f = e.target;
+  const params = collectParams(f);
+  if (!params.pool && !params.codes) { alert('请填写「股票池」或「手动代码」'); return false; }
+  const summary = paramsSummary(params);
 
   $('result').innerHTML = `
     <div class="loading">
@@ -578,6 +623,44 @@ async function onSubmit(e) {
     $('submitBtn').textContent = '▶  运行回测';
   }
   return false;
+}
+
+/* ----------- 生成调仓清单（独立入口） ----------- */
+async function onRunPlan() {
+  const f = document.forms.runForm;
+  const params = collectParams(f);
+  if (!params.pool && !params.codes) { alert('请先选「股票池」或填「手动代码」'); return; }
+
+  const srcHint = params.holdings_text.trim()
+    ? '页面填写的持仓' : '项目自带的 my_holdings.csv';
+  $('result').innerHTML = `
+    <div class="loading">
+      <div class="spinner"></div>
+      <div class="params-hint">生成调仓清单：${escapeHtml(paramsSummary(params))}</div>
+      <div class="hint">持仓来源：${escapeHtml(srcHint)} ·
+        基准日：${escapeHtml(params.plan_date || '结束日期 ' + params.end)}</div>
+    </div>`;
+  $('planBtn').disabled = true;
+  $('planBtn').textContent = '⏳ 生成中...';
+
+  try {
+    const resp = await fetch('/api/plan', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(params),
+    });
+    const data = await resp.json();
+    if (data.error) {
+      $('result').innerHTML = `<div class="error">${escapeHtml(data.error)}</div>`;
+    } else {
+      renderPlan(data);
+    }
+  } catch (err) {
+    $('result').innerHTML = `<div class="error">请求失败: ${escapeHtml(String(err))}</div>`;
+  } finally {
+    $('planBtn').disabled = false;
+    $('planBtn').textContent = '📋  生成调仓清单';
+  }
 }
 
 function escapeHtml(s) {
@@ -652,6 +735,65 @@ function renderResult(d, summary) {
   renderDrawdownChart(d);
   renderAnnualChart(d);
   renderMonthlyChart(d);
+}
+
+/* ----------- 渲染结果：调仓清单 ----------- */
+function renderPlan(d) {
+  const rows = d.today_plan || [];
+  const skipped = d.skipped || [];
+  const fmtMoney = v => (v == null || isNaN(v)) ? '-'
+    : Number(v).toLocaleString('zh-CN', { maximumFractionDigits: 0 });
+  const fmtShares = v => (v == null || isNaN(v)) ? '-'
+    : Number(v).toLocaleString('zh-CN');
+
+  const buys = rows.filter(r => (Number(r.delta_shares) || 0) > 0);
+  const sells = rows.filter(r => (Number(r.delta_shares) || 0) < 0);
+  const sum = arr => arr.reduce((a, r) => a + (Number(r.amount) || 0), 0);
+
+  let html = '';
+  if (!rows.length) {
+    html += `<div class="verdict">清单是空的。<br/>
+      常见原因：基准日<b>不是调仓日</b>，或者当前持仓已经和目标一致。<br/>
+      把「结束日期」改成最近交易日，再生成一次。</div>`;
+  } else {
+    html += `<div class="verdict">
+      基准日 <b>${escapeHtml(d.plan_date || '-')}</b> · 持仓来源：${escapeHtml(d.holding_source || '-')}<br/>
+      要<b>买入</b> ${buys.length} 笔、合计 <b>${fmtMoney(sum(buys))}</b> 元；
+      要<b>卖出</b> ${sells.length} 笔、合计 <b>${fmtMoney(sum(sells))}</b> 元。
+    </div>`;
+
+    html += `<div class="chart-card" style="overflow-x:auto">
+      <div class="chart-title">调仓清单</div>
+      <table class="tbl"><thead><tr>
+        <th>动作</th><th>代码</th><th>现价</th><th>当前股数</th><th>目标股数</th><th>本次变动</th><th>金额</th>
+      </tr></thead><tbody>`;
+    rows.forEach(r => {
+      const ds = Number(r.delta_shares) || 0;
+      const c = ds > 0 ? 'pos' : (ds < 0 ? 'neg' : '');
+      html += `<tr>
+        <td>${escapeHtml(r.action || '')}</td>
+        <td>${escapeHtml(String(r.code || ''))}</td>
+        <td>${fmtNum(r.price)}</td>
+        <td>${fmtShares(r.current_shares)}</td>
+        <td>${fmtShares(r.target_shares)}</td>
+        <td class="${c}">${ds > 0 ? '+' : ''}${fmtShares(ds)}</td>
+        <td>${fmtMoney(r.amount)}</td>
+      </tr>`;
+    });
+    html += `</tbody></table>
+      <div class="meta">股数按 100 股（1 手）取整；单笔变动不足 1 手的不进清单。</div>
+    </div>`;
+  }
+
+  if (skipped.length) {
+    html += `<div class="verdict" style="border-left-color:var(--red)">
+      <b>${skipped.length} 只持仓没能算出来：</b>${skipped.map(escapeHtml).join('、')}<br/>
+      它们不在当前股票池的价格表里，算不出目标股数。
+      <b>这不代表不用动</b>——很可能本来就该清掉，请单独确认。
+    </div>`;
+  }
+
+  $('result').innerHTML = html + fileLinks(d);
 }
 
 /* ----------- 渲染结果：样本外验证（walk-forward） ----------- */

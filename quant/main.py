@@ -341,6 +341,7 @@ def _build_today_plan(plan: pd.DataFrame, prices: pd.DataFrame,
 
     # 模式 2/3: 用 holdings 算 delta
     rows = []
+    skipped: list[str] = []
     codes = set(target_w.index)
     if holdings_df is not None:
         codes |= set(holdings_df["code"])
@@ -349,6 +350,12 @@ def _build_today_plan(plan: pd.DataFrame, prices: pd.DataFrame,
         target_amount = w * total_capital
         price = float(exec_price.get(code, np.nan))
         if pd.isna(price) or price <= 0:
+            # 最常见的原因：持仓里有当前股票池之外的股票，价格表里没有它。
+            # 必须显式告知，否则用户会把「不在清单里」误读成「这只不用调整」。
+            if holdings_df is not None:
+                m = holdings_df[holdings_df["code"] == code]
+                if not m.empty and int(m["shares"].iloc[0]) > 0:
+                    skipped.append(code)
             continue
         target_shares = int(target_amount / price / 100) * 100
         cur_shares = 0
@@ -373,6 +380,10 @@ def _build_today_plan(plan: pd.DataFrame, prices: pd.DataFrame,
             "price": round(price, 4),
             "amount": round(amount, 2),
         })
+    if skipped:
+        print(f"\n  ⚠️ 以下持仓因取不到价格而无法计算，需单独处理："
+              f"{'、'.join(skipped)}")
+        print("     （它们不在当前股票池的价格表内，不代表不需要调整）")
     return pd.DataFrame(rows).sort_values(["action", "code"]).reset_index(drop=True)
 
 
@@ -1166,8 +1177,12 @@ def main() -> None:
         today_plan.to_csv(out, index=False)
         print(f"\n【今日调仓清单】日期 {args.today or '自动'} → {out}")
         if not today_plan.empty:
+            # 列名是 delta_shares（本次变动股数）；旧代码写的 r['shares'] 不存在，
+            # 一执行就 KeyError → 进程以退出码 1 结束，调用方（如 Web）会当成失败。
+            has_qty = "delta_shares" in today_plan.columns
             for _, r in today_plan.head(30).iterrows():
-                print(f"  {r['action']:8s} {r['code']} {int(r['shares']):>6} 股"
+                qty = abs(int(r["delta_shares"])) if has_qty else 0
+                print(f"  {r['action']:8s} {r['code']} {qty:>6} 股"
                       f" @ {r['price']:.2f} = {r['amount']:>12,.2f} 元")
             if len(today_plan) > 30:
                 print(f"  ... 还有 {len(today_plan) - 30} 条")

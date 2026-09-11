@@ -136,6 +136,31 @@ def test_records_is_json_serializable():
     json.dumps(recs)          # 不抛异常即通过
 
 
+def test_records_preserves_zero_padded_codes():
+    """股票代码必须原样保留 "000858"。
+
+    这里踩过两次：先用 to_dict 遇到 NaN 报错，改用 to_json 后它又把
+    「看起来像数字的字符串」列转成了数字 —— 000858 → 858、002714 → 2714，
+    页面上代码全错。修法必须同时满足「NaN 安全」和「字符串不动」两条。
+    """
+    df = pd.DataFrame({"code": ["000858", "600519", "002714"],
+                       "v": [1.0, np.nan, 2.0]})
+    recs = web._records(df)
+    assert [r["code"] for r in recs] == ["000858", "600519", "002714"]
+    assert recs[1]["v"] is None
+
+
+def test_records_keeps_mixed_types():
+    df = pd.DataFrame({"s": ["000001"], "i": [7], "f": [1.5],
+                       "b": [True], "n": [np.nan]})
+    rec = web._records(df)[0]
+    assert rec["s"] == "000001"
+    assert rec["i"] == 7 and isinstance(rec["i"], int)
+    assert rec["f"] == 1.5
+    assert rec["b"] is True
+    assert rec["n"] is None
+
+
 def test_records_empty():
     assert web._records(pd.DataFrame()) == []
     assert web._records(pd.DataFrame({"a": []})) == []
@@ -144,6 +169,27 @@ def test_records_empty():
 def test_records_keeps_rows_and_order():
     df = pd.DataFrame({"k": ["a", "b", "c"], "v": [1, 2, 3]})
     assert [r["k"] for r in web._records(df)] == ["a", "b", "c"]
+
+
+def test_read_csv_codes_restores_leading_zeros(tmp_path):
+    """从 CSV 读 code 时必须补回前导零。
+
+    pandas 会把 "000858" 推断成整数 858、"000001" 变成 1，页面上代码就少几位。
+    这条锁的是**读入端** —— 只在输出端（_json_safe）做类型处理是修不掉的，
+    因为进到 _records 时数据已经是错的。这正是本轮踩过的坑。
+    """
+    p = tmp_path / "plan.csv"
+    p.write_text("code,action,amount\n000858,清仓,104870\n000001,清仓,100\n",
+                 encoding="utf-8")
+    df = web._read_csv_codes(p)
+    assert list(df["code"]) == ["000858", "000001"]
+
+
+def test_read_csv_codes_tolerates_missing_code_column(tmp_path):
+    p = tmp_path / "other.csv"
+    p.write_text("a,b\n1,2\n", encoding="utf-8")
+    df = web._read_csv_codes(p)
+    assert list(df.columns) == ["a", "b"]
 
 
 # --------------------------------------------------- 文件访问安全
@@ -173,6 +219,69 @@ def test_safe_file_raises_for_missing(tmp_path, monkeypatch):
     monkeypatch.setattr(web, "ROOT", tmp_path)
     with pytest.raises(Exception):
         web._safe_file("nope.html", (".html",))
+
+
+# --------------------------------------------------- 持仓解析 & 调仓清单
+
+def test_materialize_holdings_parses_common_formats(tmp_path, monkeypatch):
+    """用户是直接粘过来的，格式会很乱：逗号/空格/分号混合、带注释、代码没补零。"""
+    monkeypatch.setattr(web, "ROOT", tmp_path)
+    text = "\n".join([
+        "# 我的持仓",
+        "600519,100",
+        "000858 1000",       # 空格分隔
+        "002557;500",        # 分号分隔
+        "1,200",             # 代码不足 6 位 -> 补零
+        "",                  # 空行
+        "乱七八糟",           # 无效行
+        "600000,-5",         # 负数 -> 跳过
+    ])
+    path, src = web._materialize_holdings(text, "px_")
+    assert path is not None
+    df = pd.read_csv(path, dtype={"code": str})
+    assert list(df["code"]) == ["600519", "000858", "002557", "000001"]
+    assert list(df["shares"]) == [100, 1000, 500, 200]
+    assert "4" in src
+
+
+def test_materialize_holdings_falls_back_to_default_file(tmp_path, monkeypatch):
+    """文本框留空时应回落到项目自带的 my_holdings.csv。"""
+    monkeypatch.setattr(web, "ROOT", tmp_path)
+    (tmp_path / "my_holdings.csv").write_text("code,shares\n600519,100\n", encoding="utf-8")
+    path, src = web._materialize_holdings("", "px_")
+    assert path == str(tmp_path / "my_holdings.csv")
+    assert "my_holdings" in src
+
+
+def test_materialize_holdings_none_when_unusable(tmp_path, monkeypatch):
+    monkeypatch.setattr(web, "ROOT", tmp_path)
+    assert web._materialize_holdings("没有数字", "px_") == (None, "")
+    assert web._materialize_holdings("", "px_") == (None, "")   # 也没有默认文件
+
+
+def test_plan_cmd_adds_holdings_flag():
+    cmd = web._build_cmd(_p(), "px_", plan_only=True, holdings_path="/tmp/h.csv")
+    assert _get(cmd, "--holdings") == "/tmp/h.csv"
+
+
+def test_plan_cmd_adds_today_only_when_given():
+    a = web._build_cmd(_p(plan_date="20240909"), "px_",
+                       plan_only=True, holdings_path="/tmp/h.csv")
+    assert _get(a, "--today") == "20240909"
+    b = web._build_cmd(_p(plan_date=""), "px_",
+                       plan_only=True, holdings_path="/tmp/h.csv")
+    assert "--today" not in b
+
+
+def test_plan_flags_absent_from_normal_run():
+    """普通回测绝不能带 --holdings。
+
+    main.py 的 holdings 分支是独立 return 的，一旦带上就不会产出净值曲线，
+    页面上的图全空——这种错很难从现象反推原因。
+    """
+    cmd = web._build_cmd(_p(holdings_text="600519,100"), "px_")
+    assert "--holdings" not in cmd
+    assert "--today" not in cmd
 
 
 # --------------------------------------------------- 指标计算
