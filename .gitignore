@@ -81,3 +81,6 @@ Thumbs.db
 htmlcov/
 .pytest_cache/
 .mypy_cache/
+# pytest 默认往系统 Temp 写临时目录，沙箱环境里常被拦；
+# 用 --basetemp=.pytest_tmp 把它落到项目内，记得别提交
+.pytest_tmp/
