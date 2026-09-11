@@ -83,7 +83,8 @@ def run_rolling(score, prices, open_prices, can_buy, can_sell, args, windows):
         cs = can_sell.iloc[s:e] if can_sell is not None else None
         w = factor_weights(sc, top_n=args.top_n, freq=args.rebalance,
                           min_names=args.min_names, buffer=args.buffer,
-                          can_buy=cb, can_sell=cs)
+                          can_buy=cb, can_sell=cs,
+                          exec_shift=1 if getattr(args, "use_open", False) else 0)
         eq, m, _det = run(pr, w, open_prices=op, fee=args.fee, stamp_tax=args.stamp_tax)
         eq = eq * prev_end
         prev_end = float(eq.iloc[-1])

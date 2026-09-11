@@ -124,7 +124,8 @@ def run_compare(prices, open_prices, volume, can_buy, can_sell,
         score = cfg["builder"](args, prices, volume)
         weights = factor_weights(score, top_n=args.top_n, freq=args.rebalance,
                                  min_names=args.min_names, buffer=args.buffer,
-                                 can_buy=can_buy, can_sell=can_sell)
+                                 can_buy=can_buy, can_sell=can_sell,
+                                 exec_shift=1 if getattr(args, "use_open", False) else 0)
         # 切片到用户回测区间
         keep = prices.index >= start_ts
         p = prices.loc[keep]

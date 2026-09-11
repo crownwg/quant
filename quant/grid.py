@@ -48,7 +48,8 @@ def grid_search(prices_all: pd.DataFrame, open_all: pd.DataFrame,
         score = factors.momentum(prices_all, lb, args.skip_recent)
         weights_all = factor_weights(score, top_n=tn, freq=args.rebalance,
                                      min_names=args.min_names, buffer=buf,
-                                     can_buy=can_buy, can_sell=can_sell)
+                                     can_buy=can_buy, can_sell=can_sell,
+                                     exec_shift=1 if getattr(args, "use_open", False) else 0)
         keep = weights_all.index >= start_ts
         prices = prices_all.loc[keep]
         weights = weights_all.loc[keep]

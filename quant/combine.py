@@ -106,7 +106,7 @@ def run_one_pool(pool: str, strategy: str, args, fetch_start: str, start_ts: pd.
 
     复用 load_panel 与 feasibility filters，每个池子单独跑一次（开销较大但结果干净）。
     """
-    codes = universe.build_universe(pool)
+    codes = universe.build_universe(pool, as_of=getattr(args, "as_of", "") or args.start)
     if not codes:
         raise ValueError(f"池子 {pool!r} 无成分股")
     print(f"  [{pool:>6s} + {strategy:18s}] 池子 {len(codes)} 只", flush=True)
@@ -114,6 +114,8 @@ def run_one_pool(pool: str, strategy: str, args, fetch_start: str, start_ts: pd.
     prices_all = panel["close"]
     open_all = panel["open"]
     volume_all = panel["volume"]
+    high_all = panel.get("high", pd.DataFrame())
+    low_all = panel.get("low", pd.DataFrame())
     if prices_all.empty:
         raise RuntimeError(f"池子 {pool!r} 拉不到任何数据")
     # 可行性约束
@@ -124,11 +126,20 @@ def run_one_pool(pool: str, strategy: str, args, fetch_start: str, start_ts: pd.
         prices_all, volume_all, limit_pct=limit_pct, illiquid=illiquid,
         enable_limit=not args.no_limit_filter,
         enable_suspend=not args.no_suspend_filter,
+        open_=open_all if args.use_open else None,
+        high=high_all if not high_all.empty else None,
+        low=low_all if not low_all.empty else None,
+        exec_at_open=args.use_open,
     )
     score = PREDEFINED_BUILDERS[strategy](args, prices_all, volume_all)
+    # 次新股过滤（与 main.py 口径一致）
+    min_listed = getattr(args, "min_listed_days", 0)
+    if min_listed > 0:
+        score = score.where(filters.listing_age_mask(prices_all, min_listed))
     weights = factor_weights(score, top_n=args.top_n, freq=args.rebalance,
                              min_names=args.min_names, buffer=args.buffer,
-                             can_buy=can_buy, can_sell=can_sell)
+                             can_buy=can_buy, can_sell=can_sell,
+                             exec_shift=1 if args.use_open else 0)
     keep = prices_all.index >= start_ts
     p = prices_all.loc[keep]; o = open_all.loc[keep]; w = weights.loc[keep]
     equity, metrics, _ = run_one_backtest(p, w, o if args.use_open else None,

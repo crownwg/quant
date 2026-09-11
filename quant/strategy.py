@@ -32,7 +32,8 @@ def rebalance_flags(index: pd.DatetimeIndex, freq: str = "M") -> pd.Series:
 def factor_weights(score: pd.DataFrame, top_n: int = 10, freq: str = "M",
                    min_names: int = 1, buffer: int = 0,
                    can_buy: pd.DataFrame | None = None,
-                   can_sell: pd.DataFrame | None = None) -> pd.DataFrame:
+                   can_sell: pd.DataFrame | None = None,
+                   exec_shift: int = 0) -> pd.DataFrame:
     """按因子分数定期选股，生成每日目标权重矩阵。
 
     参数
@@ -46,6 +47,11 @@ def factor_weights(score: pd.DataFrame, top_n: int = 10, freq: str = "M",
                不因微弱的分差被换掉。0 表示不启用。
                典型取 1~2，能显著降低换手与交易成本。
     can_buy / can_sell : 可执行性面板（涨停/跌停/停牌/流动性）。
+    exec_shift : 决策日到**实际成交日**之间隔了几根 K 线。
+                 - 按收盘价成交 → 0（信号在 close[t] 算出、当刻成交）
+                 - 按次日开盘价成交 → 1（信号在 close[t] 算出、最早 open[t+1] 成交）
+                 可执行性面板会按该偏移后移，确保「用成交当日的状态」判断能否下单。
+                 不传（默认 0）时，用决策日状态判断——在开盘成交模式下这是前视偏差。
 
     返回
     ----
@@ -60,6 +66,17 @@ def factor_weights(score: pd.DataFrame, top_n: int = 10, freq: str = "M",
     这样权重矩阵在非调仓日恒定，调仓次数不会被「一次调仓拆散到多天」而虚高。
     （旧版 apply_tradability 逐日 min/max 迭代会把单次调仓拆成多次，已废弃。）
     """
+    if exec_shift:
+        # 成交发生在 exec_shift 根之后，因此要取「成交当日」的可交易性。
+        # shift(-n) 会把未来的行挪到当前位置；末行无未来可言，保守填 False。
+        def _align(mask: pd.DataFrame | None) -> pd.DataFrame | None:
+            if mask is None:
+                return None
+            return mask.shift(-exec_shift).fillna(False).astype(bool)
+
+        can_buy = _align(can_buy)
+        can_sell = _align(can_sell)
+
     flags = rebalance_flags(score.index, freq)
 
     # NaN 初始化：ffill 只填充 NaN，调仓日显式写值、非调仓日沿用。

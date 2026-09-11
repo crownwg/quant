@@ -71,6 +71,8 @@ def merge_args_config(args, cfg: dict) -> dict:
         "buffer": cfg.get("buffer", 2),
         "use_open": cfg.get("use_open", True),
         "min_volume": cfg.get("min_volume", 0.0),
+        "min_listed_days": cfg.get("min_listed_days", 0),
+        "as_of": cfg.get("as_of", ""),
         "no_limit_filter": cfg.get("no_limit_filter", False),
         "no_suspend_filter": cfg.get("no_suspend_filter", False),
         "benchmark": args.benchmark or cfg.get("benchmark", "sh000932"),
@@ -123,21 +125,25 @@ def run_daily(cfg: dict) -> dict:
 
     print(f"📅 {datetime.now():%Y-%m-%d %H:%M:%S} · 池子={pool} · 策略={strategy}")
 
-    codes = universe.build_universe(pool)
+    codes = universe.build_universe(pool, as_of=cfg.get("as_of") or None)
     if not codes:
         raise ValueError(f"池子 {pool!r} 无成分股")
 
     # 预热期：取足够长的历史覆盖 lookback 窗口
     today = pd.Timestamp(cfg["today"]) if cfg["today"] else pd.Timestamp.today().normalize()
-    fetch_start = (today - pd.Timedelta(days=cfg["fetch_lookback_days"])).strftime("%Y%m%d")
+    lookback_days = cfg["fetch_lookback_days"]
+    if cfg["min_listed_days"] > 0:
+        lookback_days = max(lookback_days, cfg["min_listed_days"] + 30)
+    fetch_start = (today - pd.Timedelta(days=lookback_days)).strftime("%Y%m%d")
     end = today.strftime("%Y%m%d")
-    start = (today - pd.Timedelta(days=cfg["fetch_lookback_days"] - 30)).strftime("%Y%m%d")
+    start = (today - pd.Timedelta(days=lookback_days - 30)).strftime("%Y%m%d")
 
-    print(f"  区间：{start} ~ {end}（共 {cfg['fetch_lookback_days']} 天）")
+    print(f"  区间：{start} ~ {end}（共 {lookback_days} 天）")
     print(f"  池子规模：{len(codes)} 只")
 
     panel = load_panel(codes, fetch_start, end, sleep=0.3, on_error="skip")
     prices_all = panel["close"]; open_all = panel["open"]; volume_all = panel["volume"]
+    high_all = panel.get("high", pd.DataFrame()); low_all = panel.get("low", pd.DataFrame())
     n_used = len(prices_all.columns)
     if prices_all.empty:
         raise RuntimeError("池子无可用数据")
@@ -151,12 +157,19 @@ def run_daily(cfg: dict) -> dict:
         prices_all, volume_all, limit_pct=limit_pct, illiquid=illiquid,
         enable_limit=not cfg["no_limit_filter"],
         enable_suspend=not cfg["no_suspend_filter"],
+        open_=open_all if cfg["use_open"] else None,
+        high=high_all if not high_all.empty else None,
+        low=low_all if not low_all.empty else None,
+        exec_at_open=cfg["use_open"],
     )
 
     # 因子 + 权重
     score = build_score(cfg, prices_all, volume_all)
+    if cfg["min_listed_days"] > 0:
+        score = score.where(filters.listing_age_mask(prices_all, cfg["min_listed_days"]))
     weights = factor_weights(score, top_n=cfg["top_n"], freq=cfg["rebalance"],
-                             buffer=cfg["buffer"], can_buy=can_buy, can_sell=can_sell)
+                             buffer=cfg["buffer"], can_buy=can_buy, can_sell=can_sell,
+                             exec_shift=1 if cfg["use_open"] else 0)
 
     # 切片到「近期评估期」（默认 5 年）
     eval_start = today - pd.Timedelta(days=365 * 5)

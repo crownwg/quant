@@ -288,7 +288,13 @@ def make_parser() -> argparse.ArgumentParser:
                    help="逗号分隔的股票代码，如 600031,000858,002557；与 --pool 二选一或合并")
     p.add_argument("--pool", default="",
                    help="股票池：指数池名(hs300/zz500/cyb/消费/白酒/蓝筹...)、6位指数代码(000300)、"
-                        "或 concept:白酒 概念板块；可逗号合并，如 hs300,消费")
+                        "concept:白酒 概念板块、all 全市场(含退市)；可逗号合并，如 hs300,消费")
+    p.add_argument("--as-of", default="",
+                   help="股票池时点日期(YYYYMMDD)：按该日期的成分股建池，消除幸存者偏差。"
+                        "默认取 --start；需要本地已积累该日期的成分股快照")
+    p.add_argument("--min-listed-days", type=int, default=0,
+                   help="剔除上市未满 N 个自然日的次新股（0=关闭）。建议 250（约一年），"
+                        "避开新股连续一字板与无涨跌停限制期")
     p.add_argument("--start", default="20200101")
     p.add_argument("--end", default="20251231")
 
@@ -383,7 +389,11 @@ def main() -> None:
     args = make_parser().parse_args()
 
     manual = [c.strip().zfill(6) for c in args.codes.split(",") if c.strip()]
-    pool_codes = universe.build_universe(args.pool) if args.pool.strip() else []
+    as_of = args.as_of.strip() or args.start
+    pool_codes: list[str] = []
+    pool_report: list[dict] = []
+    if args.pool.strip():
+        pool_codes, pool_report = universe.build_universe_report(args.pool, as_of=as_of)
     # --combine 自带池子，单独模式不需要 --codes/--pool
     if not manual and not pool_codes and not args.combine:
         raise SystemExit("必须提供 --codes 或 --pool（至少其一）；或使用 --combine 直接指定池子")
@@ -396,19 +406,35 @@ def main() -> None:
             codes.append(c)
     print(f"股票池合计 {len(codes)} 只" + (f"（手动 {len(manual)} + 池 {len(pool_codes)}）" if pool_codes else ""), flush=True)
 
+    # 幸存者偏差告警：任何子池没能做到时点正确，都必须显式提示，绝不静默放行
+    biased = [r for r in pool_report if not r["pit"]]
+    if biased:
+        print("\n" + "!" * 68)
+        print("⚠️  幸存者偏差告警：以下池子未能按历史时点取成分股")
+        for r in biased:
+            print(f"  · {r['pool']}（{r['n_codes']} 只）：{r['message']}")
+        print("!" * 68 + "\n", flush=True)
+
     # 预热期：因子需要历史数据才能计算，往前多取一段，否则开头几个月空仓
     warm_days = max(args.lookback, args.ma_long, args.vol_lookback, args.vol_long) * 2 + 30
+    # 次新股过滤按「上市自然日」判断，面板必须比回测起点再往前 min_listed_days，
+    # 否则老股票的可用历史会被误判成"刚上市"而被整体剔除。
+    if args.min_listed_days > 0:
+        warm_days = max(warm_days, args.min_listed_days + 30)
     fetch_start = (pd.Timestamp(args.start) - pd.Timedelta(days=warm_days)).strftime("%Y%m%d")
 
     # 大池首次下载较慢：池子大时降低单只间隔并允许跳过失败标的
     sleep = 0.3 if len(codes) > 20 else 1.0
     on_error = "skip" if (pool_codes or len(codes) > 20) else "raise"
     prices_all = pd.DataFrame(); open_all = pd.DataFrame(); volume_all = pd.DataFrame()
+    high_all = pd.DataFrame(); low_all = pd.DataFrame()
     if codes:  # --combine 模式下 codes 为空，跳过面板加载（池子各自在 combine 里加载）
         panel = load_panel(codes, fetch_start, args.end, sleep=sleep, on_error=on_error)
         prices_all = panel["close"]
         open_all = panel["open"]
         volume_all = panel["volume"]
+        high_all = panel.get("high", pd.DataFrame())
+        low_all = panel.get("low", pd.DataFrame())
         if len(prices_all.columns) < len(codes):
             skipped = len(codes) - len(prices_all.columns)
             print(f"⚠️ {skipped} 只代码数据不可用已跳过，实际参与回测 {len(prices_all.columns)} 只")
@@ -417,15 +443,44 @@ def main() -> None:
 
     score = build_score(args, prices_all, volume_all)
 
+    # ---- 次新股过滤：上市未满 min_listed_days 的标的不参与选股 ----
+    if args.min_listed_days > 0:
+        age_ok = filters.listing_age_mask(prices_all, args.min_listed_days)
+        blocked = int((~age_ok).sum().sum())
+        score = score.where(age_ok)
+        print(f"  次新股过滤  : 剔除上市不足 {args.min_listed_days} 自然日的标的"
+              f"（累计屏蔽 {blocked} 个 股票×交易日）")
+
     # ---- 交易可行性约束 ----
     st_codes = [c.strip() for c in args.st_codes.split(",") if c.strip()]
     limit_pct = filters.limit_pct_by_code(codes, st_codes)
     illiquid = filters.illiquid_mask(volume_all, args.min_volume)
+    limit_stats: dict = {}
     can_buy, can_sell = filters.tradability(
         prices_all, volume_all, limit_pct=limit_pct, illiquid=illiquid,
         enable_limit=not args.no_limit_filter,
         enable_suspend=not args.no_suspend_filter,
+        open_=open_all if args.use_open else None,
+        high=high_all if not high_all.empty else None,
+        low=low_all if not low_all.empty else None,
+        exec_at_open=args.use_open,
+        stats=limit_stats,
     )
+    if not args.no_limit_filter and limit_stats:
+        print(f"  涨跌停判定  : 判定价={limit_stats.get('held_price', 'close')}"
+              f" | 涨停 一字{limit_stats.get('limit_up_oneword', 0)}/封板{limit_stats.get('limit_up_close', 0)}"
+              f" | 跌停 一字{limit_stats.get('limit_down_oneword', 0)}/封板{limit_stats.get('limit_down_close', 0)}"
+              f" | 涨跌停致禁买{limit_stats.get('limit_blocked_buy', 0)}"
+              f"/禁卖{limit_stats.get('limit_blocked_sell', 0)}"
+              f"（单位：股票×交易日）")
+        parts = []
+        if "suspend_blocked" in limit_stats:
+            parts.append(f"停牌 {limit_stats['suspend_blocked']}")
+        if "illiquid_blocked" in limit_stats:
+            parts.append(f"流动性 {limit_stats['illiquid_blocked']}")
+        if parts:
+            print(f"  其他不可交易: {' + '.join(parts)}"
+                  f" | 合计禁买{limit_stats.get('blocked_buy', 0)}/禁卖{limit_stats.get('blocked_sell', 0)}")
 
     # ---- 参数优化：网格搜索（在加载面板后、单次回测前分叉）----
     if args.grid:
@@ -539,7 +594,8 @@ def main() -> None:
 
     weights_all = factor_weights(score, top_n=args.top_n, freq=args.rebalance,
                                  min_names=args.min_names, buffer=args.buffer,
-                                 can_buy=can_buy, can_sell=can_sell)
+                                 can_buy=can_buy, can_sell=can_sell,
+                                 exec_shift=1 if args.use_open else 0)
 
     # 截掉预热期，只在用户指定区间上评价
     start_ts = pd.Timestamp(args.start)
