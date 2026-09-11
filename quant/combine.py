@@ -23,10 +23,10 @@ import json
 import pandas as pd
 import numpy as np
 
-from . import factors, filters, universe
-from .backtest import run as backtest_run
+from . import factors, filters, universe, neutralize
+from .backtest import run as backtest_run, cost_kwargs
 from .data import load_panel
-from .strategy import factor_weights
+from .strategy import factor_weights, weights_from_args
 
 
 # 策略名 → factor builder（与 compare.py 共用一份）
@@ -116,12 +116,23 @@ def run_one_pool(pool: str, strategy: str, args, fetch_start: str, start_ts: pd.
     volume_all = panel["volume"]
     high_all = panel.get("high", pd.DataFrame())
     low_all = panel.get("low", pd.DataFrame())
+    amount_all = panel.get("amount", pd.DataFrame())
+    share_all = panel.get("outstanding_share", pd.DataFrame())
     if prices_all.empty:
         raise RuntimeError(f"池子 {pool!r} 拉不到任何数据")
+
+    # 日均成交额：容量约束与冲击成本的共同分母（与 main.py 口径一致）
+    adv_all = filters.adv_notional(amount=amount_all if not amount_all.empty else None,
+                                   volume=volume_all, close=prices_all)
+
     # 可行性约束
     st_codes = [c.strip() for c in args.st_codes.split(",") if c.strip()]
     limit_pct = filters.limit_pct_by_code(codes, st_codes)
     illiquid = filters.illiquid_mask(volume_all, args.min_volume)
+    illiquid_amt = filters.illiquid_mask_by_amount(
+        amount_all if not amount_all.empty else None, getattr(args, "min_amount", 0.0))
+    if illiquid_amt is not None:
+        illiquid = illiquid_amt if illiquid is None else (illiquid | illiquid_amt)
     can_buy, can_sell = filters.tradability(
         prices_all, volume_all, limit_pct=limit_pct, illiquid=illiquid,
         enable_limit=not args.no_limit_filter,
@@ -136,21 +147,30 @@ def run_one_pool(pool: str, strategy: str, args, fetch_start: str, start_ts: pd.
     min_listed = getattr(args, "min_listed_days", 0)
     if min_listed > 0:
         score = score.where(filters.listing_age_mask(prices_all, min_listed))
-    weights = factor_weights(score, top_n=args.top_n, freq=args.rebalance,
-                             min_names=args.min_names, buffer=args.buffer,
-                             can_buy=can_buy, can_sell=can_sell,
-                             exec_shift=1 if args.use_open else 0)
+    # 因子中性化（与 main.py 口径一致）
+    neut = getattr(args, "neutralize", "") or ""
+    if neut.strip():
+        mktcap_all = neutralize.mktcap_panel(
+            prices_all, amount=amount_all if not amount_all.empty else None,
+            volume=volume_all, outstanding_share=share_all if not share_all.empty else None)
+        score = neutralize.apply_neutralize(score, neut, mktcap=mktcap_all, verbose=False)
+    weight_cap_all = filters.capacity_cap(
+        adv_all, args.capital, getattr(args, "max_participation", 0.0))
+    weights = weights_from_args(score, args, can_buy=can_buy, can_sell=can_sell,
+                                prices=prices_all, weight_cap=weight_cap_all)
     keep = prices_all.index >= start_ts
     p = prices_all.loc[keep]; o = open_all.loc[keep]; w = weights.loc[keep]
     equity, metrics, _ = run_one_backtest(p, w, o if args.use_open else None,
-                                           fee=args.fee, stamp_tax=args.stamp_tax)
+                                           adv=(adv_all.loc[keep] if adv_all is not None else None))
     return equity, metrics, len(prices_all.columns)
 
 
-def run_one_backtest(prices, weights, open_prices, fee, stamp_tax):
+def run_one_backtest(prices, weights, open_prices, adv=None, args=None):
     """简单封装 backtest.run，便于阅读。"""
-    return backtest_run(prices, weights, open_prices=open_prices,
-                        fee=fee, stamp_tax=stamp_tax)
+    if args is not None:
+        return backtest_run(prices, weights, open_prices=open_prices, **cost_kwargs(args, adv=adv))
+    return backtest_run(prices, weights, open_prices=open_prices, adv=adv)
+
 
 
 # ------------------------------------------------------------- 组合整合

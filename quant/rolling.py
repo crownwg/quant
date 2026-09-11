@@ -12,8 +12,8 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from .backtest import run
-from .strategy import factor_weights
+from .backtest import run, cost_kwargs
+from .strategy import factor_weights, weights_from_args
 
 
 def annual_breakdown(equity: pd.Series, detail: pd.DataFrame,
@@ -67,7 +67,8 @@ def rolling_windows(n: int, window: int = 504, step: int | None = None,
     return windows
 
 
-def run_rolling(score, prices, open_prices, can_buy, can_sell, args, windows):
+def run_rolling(score, prices, open_prices, can_buy, can_sell, args, windows,
+                weight_cap=None):
     """对每段窗口独立回测，返回 [(start_date, end_date, equity, metrics), ...]。
 
     每段净值从上一窗口末值衔接，模拟「一直按策略投资」的连续曲线；
@@ -81,11 +82,9 @@ def run_rolling(score, prices, open_prices, can_buy, can_sell, args, windows):
         op = open_prices.iloc[s:e] if open_prices is not None else None
         cb = can_buy.iloc[s:e] if can_buy is not None else None
         cs = can_sell.iloc[s:e] if can_sell is not None else None
-        w = factor_weights(sc, top_n=args.top_n, freq=args.rebalance,
-                          min_names=args.min_names, buffer=args.buffer,
-                          can_buy=cb, can_sell=cs,
-                          exec_shift=1 if getattr(args, "use_open", False) else 0)
-        eq, m, _det = run(pr, w, open_prices=op, fee=args.fee, stamp_tax=args.stamp_tax)
+        w = weights_from_args(sc, args, can_buy=cb, can_sell=cs, prices=pr,
+                              weight_cap=(weight_cap.iloc[s:e] if weight_cap is not None else None))
+        eq, m, _det = run(pr, w, open_prices=op, **cost_kwargs(args))
         eq = eq * prev_end
         prev_end = float(eq.iloc[-1])
         results.append((eq.index[0], eq.index[-1], eq, m))

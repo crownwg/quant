@@ -18,8 +18,8 @@ from __future__ import annotations
 import pandas as pd
 
 from . import factors, rolling
-from .backtest import run as backtest_run
-from .strategy import factor_weights
+from .backtest import run as backtest_run, cost_kwargs
+from .strategy import factor_weights, weights_from_args
 
 
 # ------------------------------------------------------- 预定义策略池
@@ -102,7 +102,7 @@ def parse_strategy_spec(text: str) -> list[str]:
 # ------------------------------------------------------- 主流程
 
 def run_compare(prices, open_prices, volume, can_buy, can_sell,
-                strategies, args, benchmark_curve=None):
+                strategies, args, benchmark_curve=None, weight_cap=None):
     """逐策略跑回测，汇总指标 + 净值曲线 + 年度收益。
 
     返回
@@ -122,10 +122,8 @@ def run_compare(prices, open_prices, volume, can_buy, can_sell,
     for name in strategies:
         cfg = PREDEFINED_STRATEGIES[name]
         score = cfg["builder"](args, prices, volume)
-        weights = factor_weights(score, top_n=args.top_n, freq=args.rebalance,
-                                 min_names=args.min_names, buffer=args.buffer,
-                                 can_buy=can_buy, can_sell=can_sell,
-                                 exec_shift=1 if getattr(args, "use_open", False) else 0)
+        weights = weights_from_args(score, args, can_buy=can_buy, can_sell=can_sell,
+                                    prices=prices, weight_cap=weight_cap)
         # 切片到用户回测区间
         keep = prices.index >= start_ts
         p = prices.loc[keep]
@@ -134,7 +132,7 @@ def run_compare(prices, open_prices, volume, can_buy, can_sell,
         equity, metrics, detail = backtest_run(
             p, w,
             open_prices=o if args.use_open else None,
-            fee=args.fee, stamp_tax=args.stamp_tax,
+            **cost_kwargs(args),
         )
         # 超额 vs 基准（如果提供）
         if benchmark_curve is not None:

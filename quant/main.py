@@ -43,13 +43,16 @@ from .backtest import run
 from .data import load_panel, load_index
 from .rebalance import build_plan, summarize
 from .report import build_report
-from .strategy import factor_weights
+from .strategy import factor_weights, weights_from_args
 from . import universe
 from . import rolling
 from . import attribution
 from . import grid
 from . import compare
 from . import combine
+from . import neutralize
+from . import factor_eval
+from .backtest import cost_kwargs
 
 
 # ----------------------------------------------------------- 因子构造
@@ -131,7 +134,8 @@ GROUPS = [
     ("风险", ["max_drawdown", "max_drawdown_days", "annual_volatility"]),
     ("风险调整收益", ["sharpe", "sortino", "calmar"]),
     ("交易特征", ["win_rate", "profit_loss_ratio", "average_daily_turnover", "annual_turnover"]),
-    ("交易成本（占本金比例）", ["total_commission", "total_stamp_tax", "total_cost", "cost_drag_annual"]),
+    ("交易成本（占本金比例）", ["total_commission", "total_stamp_tax", "total_slippage",
+                            "total_impact", "total_cost", "cost_drag_annual"]),
     ("相对基准", ["excess_return", "information_ratio"]),
     ("样本", ["trading_days", "years"]),
 ]
@@ -152,6 +156,8 @@ LABELS = {
     "annual_turnover": "年化双边换手",
     "total_commission": "佣金总额",
     "total_stamp_tax": "印花税总额",
+    "total_slippage": "滑点成本",
+    "total_impact": "冲击成本",
     "total_cost": "成本总额",
     "cost_drag_annual": "成本年化拖累",
     "excess_return": "超额收益",
@@ -312,6 +318,19 @@ def make_parser() -> argparse.ArgumentParser:
     p.add_argument("--buffer", type=int, default=0,
                    help="换手缓冲：老持仓排名仍在 top_n+buffer 内就继续持有，抑制频繁对倒")
 
+    # 权重方案与集中度
+    p.add_argument("--weighting", default="equal",
+                   choices=["equal", "inv_vol", "score", "rank"],
+                   help="权重分配：equal 等权 / inv_vol 波动率倒数(近似风险平价) / "
+                        "score 按分数幅度加权 / rank 按排名线性加权")
+    p.add_argument("--max-weight", type=float, default=0.0,
+                   help="单票权重上限，如 0.2；0=不限。超出部分按比例分配给未触顶标的，"
+                        "全部触顶则留现金（不强行满仓）")
+    p.add_argument("--neutralize", default="",
+                   help="因子中性化，可组合：industry（行业内去均值）/ size（市值分组去均值），"
+                        "如 --neutralize industry,size。用于剥离行业/小市值 beta，"
+                        "避免把 beta 收益误当成因子 alpha")
+
     # 因子参数
     p.add_argument("--lookback", type=int, default=120, help="动量因子回看天数")
     p.add_argument("--skip-recent", type=int, default=0, help="动量跳过最近 N 日（12-1 动量）")
@@ -328,6 +347,13 @@ def make_parser() -> argparse.ArgumentParser:
                    help="次日开盘价成交（消除前视偏差，推荐常开）")
     p.add_argument("--min-volume", type=float, default=0.0,
                    help="流动性门槛：近 20 日均成交量（股）低于该值则不可交易")
+    p.add_argument("--min-amount", type=float, default=0.0,
+                   help="流动性门槛（金额口径，元）：近 20 日均成交额低于该值则不可交易。"
+                        "比 --min-volume 更合理——1000 万股对 3 元股是 3000 万、对 300 元股是 30 亿")
+    p.add_argument("--max-participation", type=float, default=0.0,
+                   help="容量约束：单票权重上限 = 参与率 × 20日均成交额 / 本金。"
+                        "0=不限；建议 0.05~0.10。一次性吃掉某票当日 30%% 成交额时，"
+                        "回测里假设的成交价根本拿不到")
     p.add_argument("--no-limit-filter", action="store_true", help="关闭涨跌停过滤")
     p.add_argument("--no-suspend-filter", action="store_true", help="关闭停牌过滤")
     p.add_argument("--st-codes", default="", help="ST 股代码，逗号分隔（涨跌停幅度按 5%% 计）")
@@ -336,6 +362,14 @@ def make_parser() -> argparse.ArgumentParser:
     p.add_argument("--capital", type=float, default=1_000_000.0, help="组合本金（调仓清单用）")
     p.add_argument("--fee", type=float, default=0.0003, help="佣金费率（双边）")
     p.add_argument("--stamp-tax", type=float, default=0.0005, help="印花税率（仅卖出）")
+    p.add_argument("--slippage", type=float, default=0.0005,
+                   help="滑点率（单边，按成交额），默认 5bp。月频换手 10 只票时滑点通常"
+                        "吃掉 1~3%%/年，设为 0 会系统性高估收益")
+    p.add_argument("--min-commission", type=float, default=5.0,
+                   help="单笔最低佣金（元），默认 5。低本金时这项比费率本身更重要")
+    p.add_argument("--impact-coef", type=float, default=0.0,
+                   help="冲击成本系数（平方根模型）：impact = coef × sqrt(成交额/日均成交额)。"
+                        "0=关闭；0.1 意味着吃掉 100%% ADV 时额外 10%% 冲击")
 
     # 输出
     p.add_argument("--out-prefix", default="", help="输出文件名前缀")
@@ -365,11 +399,25 @@ def make_parser() -> argparse.ArgumentParser:
     p.add_argument("--grid-buffers", default="0,2",
                    help="网格 buffer 候选，逗号分隔，默认 0,2")
 
+    # 因子有效性检验
+    p.add_argument("--factor-eval", action="store_true",
+                   help="因子有效性检验：输出 IC / IR / 正IC占比 / 因子衰减 / 分组收益。"
+                        "直接回答「分数靠前的股票是否真的跑赢」——净值曲线回答不了这个问题")
+
     # 多策略对比
     p.add_argument("--compare", action="store_true",
                    help="多策略对比：同一池子横向跑多个预定义策略，挑稳健组合")
     p.add_argument("--compare-strategies", default="",
                    help="对比策略列表，逗号分隔，如 momentum_120,reversal_20；为空用默认 7 个")
+
+    # 样本外验证（walk-forward）
+    p.add_argument("--walk-forward", action="store_true",
+                   help="样本外验证：滚动「训练窗选参 → 紧邻测试窗纯验证」，"
+                        "并与「全样本最优参数」「默认参数」对比，识别参数过拟合")
+    p.add_argument("--fw-train", type=float, default=2.0, help="walk-forward 训练窗长度（年），默认 2")
+    p.add_argument("--fw-test", type=float, default=0.5, help="walk-forward 测试窗长度（年），默认 0.5")
+    p.add_argument("--fw-metric", default="sharpe", choices=["sharpe", "calmar", "total_return"],
+                   help="训练窗内选参依据，默认 sharpe")
 
     # 多池组合配置
     p.add_argument("--combine", default="",
@@ -428,6 +476,7 @@ def main() -> None:
     on_error = "skip" if (pool_codes or len(codes) > 20) else "raise"
     prices_all = pd.DataFrame(); open_all = pd.DataFrame(); volume_all = pd.DataFrame()
     high_all = pd.DataFrame(); low_all = pd.DataFrame()
+    amount_all = pd.DataFrame(); share_all = pd.DataFrame()
     if codes:  # --combine 模式下 codes 为空，跳过面板加载（池子各自在 combine 里加载）
         panel = load_panel(codes, fetch_start, args.end, sleep=sleep, on_error=on_error)
         prices_all = panel["close"]
@@ -435,13 +484,34 @@ def main() -> None:
         volume_all = panel["volume"]
         high_all = panel.get("high", pd.DataFrame())
         low_all = panel.get("low", pd.DataFrame())
+        amount_all = panel.get("amount", pd.DataFrame())
+        share_all = panel.get("outstanding_share", pd.DataFrame())
         if len(prices_all.columns) < len(codes):
             skipped = len(codes) - len(prices_all.columns)
             print(f"⚠️ {skipped} 只代码数据不可用已跳过，实际参与回测 {len(prices_all.columns)} 只")
         if prices_all.empty:
             raise SystemExit("没有任何可用数据，回测终止")
 
+    # ---- 日均成交额 ADV：容量约束与冲击成本的共同分母 ----
+    adv_all = filters.adv_notional(amount=amount_all if not amount_all.empty else None,
+                                   volume=volume_all, close=prices_all)
+    if adv_all is None or adv_all.empty:
+        adv_all = None
+        has_adv = False
+    else:
+        has_adv = bool(adv_all.notna().any().any())
+    # 挂到 args 上：backtest.cost_kwargs 会取它做冲击成本，各入口口径一致
+    args.adv_panel = adv_all
+
     score = build_score(args, prices_all, volume_all)
+
+    # ---- 因子中性化：剥离行业 / 市值 beta ----
+    if args.neutralize.strip():
+        mktcap_all = neutralize.mktcap_panel(
+            prices_all, amount=amount_all if not amount_all.empty else None,
+            volume=volume_all, outstanding_share=share_all if not share_all.empty else None)
+        score = neutralize.apply_neutralize(score, args.neutralize,
+                                            mktcap=mktcap_all, verbose=True)
 
     # ---- 次新股过滤：上市未满 min_listed_days 的标的不参与选股 ----
     if args.min_listed_days > 0:
@@ -455,6 +525,28 @@ def main() -> None:
     st_codes = [c.strip() for c in args.st_codes.split(",") if c.strip()]
     limit_pct = filters.limit_pct_by_code(codes, st_codes)
     illiquid = filters.illiquid_mask(volume_all, args.min_volume)
+    # 金额口径的流动性门槛与股数口径取并集（两条都需要满足）
+    illiquid_amt = filters.illiquid_mask_by_amount(
+        amount_all if not amount_all.empty else None, args.min_amount)
+    if illiquid_amt is not None:
+        illiquid = illiquid_amt if illiquid is None else (illiquid | illiquid_amt)
+
+    # ---- 容量约束：单票权重上限 = 参与率 × ADV / 本金 ----
+    weight_cap_all = filters.capacity_cap(adv_all, args.capital, args.max_participation)
+    if weight_cap_all is not None:
+        finite = weight_cap_all.notna()
+        if finite.any().any():
+            median_cap = float(weight_cap_all.stack().median())
+            n_tight = int((weight_cap_all.min(axis=0) < 1.0 / max(args.top_n, 1)).sum())
+            if median_cap >= 1.0:
+                print(f"  容量约束    : 参与率 {args.max_participation:.0%} · 本金 "
+                      f"{args.capital:,.0f} 元 → 容量充裕，不构成约束"
+                      f"（单票上限中位数 {median_cap:.0%} 已超过满仓）")
+            else:
+                print(f"  容量约束    : 参与率 {args.max_participation:.0%} · 本金 "
+                      f"{args.capital:,.0f} 元 → 单票上限中位数 {median_cap:.2%}"
+                      f"（{n_tight} 只标的的容量低于等权仓位 {1.0/max(args.top_n,1):.2%}）")
+
     limit_stats: dict = {}
     can_buy, can_sell = filters.tradability(
         prices_all, volume_all, limit_pct=limit_pct, illiquid=illiquid,
@@ -482,6 +574,39 @@ def main() -> None:
             print(f"  其他不可交易: {' + '.join(parts)}"
                   f" | 合计禁买{limit_stats.get('blocked_buy', 0)}/禁卖{limit_stats.get('blocked_sell', 0)}")
 
+    # ---- 因子有效性检验：直接回答「因子有没有用」，与回测相互独立----
+    if args.factor_eval:
+        print("\n【因子有效性检验】横截面 Rank IC（未来 20 日收益）")
+        # 待检验因子集合：--factors 指定则只验这些；否则验当前策略的因子
+        # 外加两个对照因子，便于横向比较「当前因子是否真的有信息」
+        to_eval: dict[str, "pd.DataFrame"] = {}
+        if args.factors:
+            for name, w in parse_factor_spec(args.factors).items():
+                to_eval[name] = FACTOR_BUILDERS[name](args, prices_all, volume_all)
+        else:
+            to_eval[args.strategy] = FACTOR_BUILDERS[args.strategy](args, prices_all, volume_all)
+            for name in ("momentum", "reversal", "low_volatility"):
+                if name not in to_eval:
+                    to_eval[name] = FACTOR_BUILDERS[name](args, prices_all, volume_all)
+        if args.neutralize.strip():
+            mktcap_all = neutralize.mktcap_panel(
+                prices_all, amount=amount_all if not amount_all.empty else None,
+                volume=volume_all,
+                outstanding_share=share_all if not share_all.empty else None)
+            for name in list(to_eval):
+                to_eval[name] = neutralize.apply_neutralize(
+                    to_eval[name], args.neutralize, mktcap=mktcap_all, verbose=False)
+
+        results = factor_eval.evaluate_many(to_eval, prices_all)
+        factor_eval.print_summary(results)
+        out_html = f"{args.out_prefix}factor_eval.html"
+        factor_eval.build_ic_report(
+            results, out_html, title="因子有效性检验",
+            subtitle=(f"股票池 {len(prices_all.columns)}只 · 区间 {args.start}~{args.end} · "
+                      f"中性化 {args.neutralize or '无'}"))
+        print(f"\n因子检验报告已保存: {out_html}")
+        return
+
     # ---- 参数优化：网格搜索（在加载面板后、单次回测前分叉）----
     if args.grid:
         lookbacks = grid.parse_ints(args.grid_lookbacks)
@@ -497,7 +622,8 @@ def main() -> None:
         print(f"\n【参数优化】网格 {len(lookbacks)}×{len(top_ns)}×{len(buffers)} = {ncomb} 组，池子 {len(codes)} 只")
         start_ts = pd.Timestamp(args.start)
         res = grid.grid_search(prices_all, open_all, can_buy, can_sell, args,
-                               lookbacks, top_ns, buffers, start_ts, benchmark_curve=bench)
+                               lookbacks, top_ns, buffers, start_ts, benchmark_curve=bench,
+                               weight_cap=weight_cap_all)
         res.to_csv(f"{args.out_prefix}grid_results.csv", index=False)
         sub = (f"池子 {len(codes)}只 · 区间 {args.start}~{args.end} · "
                f"网格 {len(lookbacks)}×{len(top_ns)}×{len(buffers)} · 基准 {args.benchmark or '无'}")
@@ -511,6 +637,40 @@ def main() -> None:
                   f" 回撤 {r['max_drawdown']:.1%} 最差年 {r['worst_year_return']:.1%}"
                   f" 正年 {r['positive_year_ratio']:.0%}{er}")
         print(f"\n网格结果已保存: {args.out_prefix}grid_results.csv / {args.out_prefix}grid_report.html")
+        return
+
+    # ---- 样本外验证：walk-forward（识别参数过拟合）----
+    if args.walk_forward:
+        lookbacks = grid.parse_ints(args.grid_lookbacks)
+        top_ns = grid.parse_ints(args.grid_topn)
+        buffers = grid.parse_ints(args.grid_buffers)
+        start_ts = pd.Timestamp(args.start)
+        print(f"\n【样本外验证】walk-forward · 训练 {args.fw_train} 年 / 测试 {args.fw_test} 年"
+              f" · 网格 {len(lookbacks)}×{len(top_ns)}×{len(buffers)}")
+        res = grid.walk_forward_search(
+            prices_all, open_all, can_buy, can_sell, args,
+            lookbacks, top_ns, buffers, start_ts,
+            train_years=args.fw_train, test_years=args.fw_test,
+            weight_cap=weight_cap_all, select_metric=args.fw_metric)
+        res["folds"].to_csv(f"{args.out_prefix}wf_folds.csv", index=False)
+        res["summary"].to_csv(f"{args.out_prefix}wf_summary.csv", index=False)
+        grid.build_wf_report(
+            res, f"{args.out_prefix}wf_report.html",
+            title="样本外验证（Walk-Forward）",
+            subtitle=(f"池子 {len(codes)}只 · 区间 {args.start}~{args.end} · "
+                      f"训练 {res['train_n']}日/测试 {res['test_n']}日 · "
+                      f"全样本最优 lb={res['full_best_combo'][0]} n={res['full_best_combo'][1]} "
+                      f"buf={res['full_best_combo'][2]}"))
+        print("\n【样本外表现对比】")
+        for _, r in res["summary"].iterrows():
+            print(f"  {r['strategy']:<26s} 总收益 {r['total_return']:>7.1%}"
+                  f" 年化 {r['annual_return']:>6.1%} 平均夏普 {r['avg_sharpe']:>5.2f}"
+                  f" 正收益折 {r['positive_folds']:.0%}")
+        gap = (res["summary"].iloc[1]["total_return"] - res["summary"].iloc[0]["total_return"])
+        print(f"\n  事后选参 vs 自适应选参 差距：{gap:+.1%}"
+              + ("（事后选参高估，说明参数在拟合噪声）" if gap > 0.02 else "（差距不大）"))
+        print(f"\n样本外验证结果已保存: {args.out_prefix}wf_folds.csv"
+              f" / {args.out_prefix}wf_summary.csv / {args.out_prefix}wf_report.html")
         return
 
     # ---- 多策略对比：在加载面板后、单次回测前分叉 ----
@@ -533,7 +693,7 @@ def main() -> None:
                 bench = None
         results_df, equity_dict, annual_dict, params_dict = compare.run_compare(
             prices_all, open_all, volume_all, can_buy, can_sell,
-            strategies, args, benchmark_curve=bench,
+            strategies, args, benchmark_curve=bench, weight_cap=weight_cap_all,
         )
         results_df.to_csv(f"{args.out_prefix}compare_results.csv", index=False)
         sub = (f"池子 {len(codes)}只 · 区间 {args.start}~{args.end} · "
@@ -592,10 +752,8 @@ def main() -> None:
               f" / {args.out_prefix}combine_report.html")
         return
 
-    weights_all = factor_weights(score, top_n=args.top_n, freq=args.rebalance,
-                                 min_names=args.min_names, buffer=args.buffer,
-                                 can_buy=can_buy, can_sell=can_sell,
-                                 exec_shift=1 if args.use_open else 0)
+    weights_all = weights_from_args(score, args, can_buy=can_buy, can_sell=can_sell,
+                                    prices=prices_all, weight_cap=weight_cap_all)
 
     # 截掉预热期，只在用户指定区间上评价
     start_ts = pd.Timestamp(args.start)
@@ -610,7 +768,7 @@ def main() -> None:
 
     equity, metrics, detail = run(prices, weights,
                                   open_prices=open_prices if args.use_open else None,
-                                  fee=args.fee, stamp_tax=args.stamp_tax)
+                                  **cost_kwargs(args))
 
     # ---- 分年度稳健性分解（默认输出）----
     annual = rolling.annual_breakdown(equity, detail)
@@ -626,7 +784,8 @@ def main() -> None:
         windows = [(s, e) for (s, e) in windows if prices_all.index[s] >= start_ts]
         if windows:
             roll_results = rolling.run_rolling(
-                score, prices_all, open_all, can_buy, can_sell, args, windows)
+                score, prices_all, open_all, can_buy, can_sell, args, windows,
+                weight_cap=weight_cap_all)
             rolling_equity = rolling.concat_equity(roll_results)
             rolling_table = pd.DataFrame([
                 {"start": r[0].date(), "end": r[1].date(), **r[3]} for r in roll_results
@@ -722,6 +881,17 @@ def main() -> None:
     if args.min_volume > 0:
         filters_on.append(f"流动性>{args.min_volume:,.0f}股")
     print(f"  启用过滤    : {' + '.join(filters_on) if filters_on else '无'}")
+    weight_desc = {"equal": "等权", "inv_vol": "波动率倒数(风险平价)",
+                   "score": "分数加权", "rank": "排名加权"}[args.weighting]
+    print(f"  权重方案    : {weight_desc}"
+          + (f" · 单票上限 {args.max_weight:.0%}" if args.max_weight > 0 else ""))
+    if args.neutralize.strip():
+        print(f"  因子中性化  : {args.neutralize}")
+    cost_desc = (f"佣金 {args.fee:.4%}(最低 {args.min_commission:g}元/笔)"
+                 f" + 印花税 {args.stamp_tax:.4%} + 滑点 {args.slippage:.4%}")
+    if args.impact_coef > 0:
+        cost_desc += f" + 冲击(coef={args.impact_coef:g})"
+    print(f"  成本模型    : {cost_desc}")
 
     print_metrics(metrics)
 

@@ -35,10 +35,10 @@ from pathlib import Path
 import pandas as pd
 
 from . import factors, filters
-from .backtest import run as backtest_run
+from .backtest import run as backtest_run, cost_kwargs
 from .data import load_index, load_panel
 from .rebalance import build_plan
-from .strategy import factor_weights
+from .strategy import factor_weights, weights_from_args
 from . import universe
 
 
@@ -71,6 +71,14 @@ def merge_args_config(args, cfg: dict) -> dict:
         "buffer": cfg.get("buffer", 2),
         "use_open": cfg.get("use_open", True),
         "min_volume": cfg.get("min_volume", 0.0),
+        "min_amount": cfg.get("min_amount", 0.0),
+        "max_participation": cfg.get("max_participation", 0.0),
+        "weighting": cfg.get("weighting", "equal"),
+        "max_weight": cfg.get("max_weight", 0.0),
+        "neutralize": cfg.get("neutralize", ""),
+        "slippage": cfg.get("slippage", 0.0005),
+        "min_commission": cfg.get("min_commission", 5.0),
+        "impact_coef": cfg.get("impact_coef", 0.0),
         "min_listed_days": cfg.get("min_listed_days", 0),
         "as_of": cfg.get("as_of", ""),
         "no_limit_filter": cfg.get("no_limit_filter", False),
@@ -144,15 +152,23 @@ def run_daily(cfg: dict) -> dict:
     panel = load_panel(codes, fetch_start, end, sleep=0.3, on_error="skip")
     prices_all = panel["close"]; open_all = panel["open"]; volume_all = panel["volume"]
     high_all = panel.get("high", pd.DataFrame()); low_all = panel.get("low", pd.DataFrame())
+    amount_all = panel.get("amount", pd.DataFrame())
     n_used = len(prices_all.columns)
     if prices_all.empty:
         raise RuntimeError("池子无可用数据")
     if n_used < len(codes):
         print(f"  ⚠️ {len(codes) - n_used} 只数据不可用，实际 {n_used} 只")
 
+    adv_all = filters.adv_notional(amount=amount_all if not amount_all.empty else None,
+                                   volume=volume_all, close=prices_all)
+
     # 可行性约束
     limit_pct = filters.limit_pct_by_code(codes, [])
     illiquid = filters.illiquid_mask(volume_all, cfg["min_volume"])
+    illiquid_amt = filters.illiquid_mask_by_amount(
+        amount_all if not amount_all.empty else None, cfg.get("min_amount", 0.0))
+    if illiquid_amt is not None:
+        illiquid = illiquid_amt if illiquid is None else (illiquid | illiquid_amt)
     can_buy, can_sell = filters.tradability(
         prices_all, volume_all, limit_pct=limit_pct, illiquid=illiquid,
         enable_limit=not cfg["no_limit_filter"],
@@ -167,9 +183,10 @@ def run_daily(cfg: dict) -> dict:
     score = build_score(cfg, prices_all, volume_all)
     if cfg["min_listed_days"] > 0:
         score = score.where(filters.listing_age_mask(prices_all, cfg["min_listed_days"]))
-    weights = factor_weights(score, top_n=cfg["top_n"], freq=cfg["rebalance"],
-                             buffer=cfg["buffer"], can_buy=can_buy, can_sell=can_sell,
-                             exec_shift=1 if cfg["use_open"] else 0)
+    weight_cap_all = filters.capacity_cap(
+        adv_all, cfg["capital"], cfg.get("max_participation", 0.0))
+    weights = weights_from_args(score, cfg, can_buy=can_buy, can_sell=can_sell,
+                                prices=prices_all, weight_cap=weight_cap_all)
 
     # 切片到「近期评估期」（默认 5 年）
     eval_start = today - pd.Timedelta(days=365 * 5)
@@ -180,7 +197,7 @@ def run_daily(cfg: dict) -> dict:
     equity, metrics, _ = backtest_run(
         prices, w_eval,
         open_prices=open_prices if cfg["use_open"] else None,
-        fee=cfg["fee"], stamp_tax=cfg["stamp_tax"],
+        **cost_kwargs(cfg, adv=(adv_all.loc[keep] if adv_all is not None else None)),
     )
 
     # 基准对比

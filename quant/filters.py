@@ -178,6 +178,78 @@ def listing_age_mask(prices: pd.DataFrame, min_days: int = 0) -> pd.DataFrame | 
     return pd.DataFrame(cols, index=idx).fillna(False)
 
 
+def amt_notional(amount: pd.DataFrame | None, volume: pd.DataFrame,
+                 close: pd.DataFrame) -> pd.DataFrame:
+    """成交额面板（元）。优先用缓存的 amount；缺失时用 成交量×收盘价 近似。
+
+    ⚠️ 近似路径只在「收盘价未复权」时才准确。本项目缓存的是前复权价，
+    因此 volume×close 得到的不是真实成交额，只适合做**相对**比较。
+    """
+    if amount is not None and not amount.empty:
+        return amount.astype(float)
+    return (volume.astype(float) * close.astype(float)).replace(0.0, np.nan)
+
+
+def adv_notional(amount: pd.DataFrame | None = None, volume: pd.DataFrame | None = None,
+                 close: pd.DataFrame | None = None, window: int = 20,
+                 min_periods: int = 5) -> pd.DataFrame | None:
+    """日均成交额 ADV（元）面板：近 window 日均值，停牌日（0）先剔除。
+
+    ADV 是两项约束的共同分母：
+      - 容量约束：单票能持有的最大权重（见 capacity_cap）
+      - 冲击成本：成交额相对 ADV 的比例决定冲击幅度（见 backtest.run 的 impact_coef）
+
+    为什么必须剔除 0：一次长期停牌会把 20 日均值拉低一个量级，
+    导致复牌后很长一段时间被误判为「容量不足」而剔除。
+    """
+    if amount is None and (volume is None or close is None):
+        return None
+    base = amt_notional(amount, volume, close)
+    if base is None or base.empty:
+        return None
+    clean = base.astype(float).where(base.astype(float) > 0)
+    return clean.rolling(window, min_periods=min_periods).mean()
+
+
+def capacity_cap(adv: pd.DataFrame | None, capital: float,
+                 max_participation: float = 0.10) -> pd.DataFrame | None:
+    """容量上限面板：单票权重上限（date×code）。
+
+    约束来源很直接——你若想把 w 的仓位全部建成一只票，需要买入
+    w × capital 元的股票，而这只票一天只能成交约 ADV 元。
+    若单日成交量不超过当日成交额的 max_participation 倍（例如 10%），
+    则该票的权重上限为：
+
+         w_max = max_participation × ADV / capital
+
+    为什么单日参与率要设上限：一次性吃掉某只票当日 30% 的成交额，
+    价格会被你自己推走，回测里假设的成交价根本拿不到。
+    业内常见 5%~20%，对月度调仓的低频策略 10% 已偏激进。
+
+    返回的面板里 **NaN 表示无约束**（该日成交额为 0，即停牌或数据缺失——
+    这类日子本来就不可交易，由停牌过滤负责，不该在这里把仓位清零）。
+    """
+    if adv is None or adv.empty or capital <= 0 or max_participation <= 0:
+        return None
+    a = adv.astype(float)
+    cap = max_participation * a / capital
+    return cap.where(a > 0)          # 成交额为 0 → NaN（无约束）
+
+
+def illiquid_mask_by_amount(amount: pd.DataFrame | None, min_amount: float,
+                            window: int = 20, min_periods: int = 5) -> pd.DataFrame | None:
+    """按「日均成交额（元）」判定流动性不足，比按股数更贴近实际可交易性。
+
+    1000 万股成交量对 3 元股是 3000 万元，对 300 元股是 30 亿元，
+    用股数做门槛会把低价股全部误杀。用金额口径才是同一条尺子。
+    """
+    if min_amount <= 0 or amount is None:
+        return None
+    clean = amount.astype(float).where(amount.astype(float) > 0)
+    avg = clean.rolling(window, min_periods=min_periods).mean()
+    return (avg < min_amount).fillna(True)
+
+
 def tradability(close: pd.DataFrame, volume: pd.DataFrame,
                 limit_pct=0.10, illiquid: pd.DataFrame | None = None,
                 enable_limit: bool = True, enable_suspend: bool = True,

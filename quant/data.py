@@ -285,20 +285,26 @@ def load_daily(code: str, start: str, end: str, data_dir: str = "data") -> pd.Da
     if missing:
         raise ValueError(f"{code} 缺少字段: {sorted(missing)}")
     df["date"] = pd.to_datetime(df["date"])
-    # high/low 用于涨跌停的精确判定（一字板识别），缓存里本来就存了，这里一并暴露出去。
-    cols = [c for c in ["open", "high", "low", "close", "volume"] if c in df.columns]
+    # 缓存里本来就有 amount（成交额，元）/ outstanding_share（流通股本），
+    # 一并暴露出去：前者是容量约束（成交量限制）与冲击成本的分母，
+    # 后者是市值中性化需要的规模代理。不需要额外联网。
+    cols = [c for c in ["open", "high", "low", "close", "volume",
+                        "amount", "outstanding_share"] if c in df.columns]
     return df.sort_values("date").set_index("date")[cols].astype(float)
 
 
 def load_panel(codes, start, end, data_dir="data", sleep: float = 1.0, on_error: str = "raise"):
-    """返回 {'open','high','low','close','volume'} 五个 date×code 面板。
+    """返回价格/成交量/成交额面板：{'open','high','low','close','volume','amount','outstanding_share'}。
 
-    high/low 供 filters 做涨跌停价判定；缺失的标的该面板不会有对应列。
+    - high/low 供 filters 做涨跌停价判定；
+    - amount（成交额，元）供 filters 做容量约束与冲击成本；
+    - outstanding_share（流通股本）供 neutralize 做市值中性化。
+    老缓存若缺 amount/outstanding_share，对应面板会缺少该列（调用方需容错）。
 
     on_error='raise'（默认）：单只拉取失败则整体报错，保持原有严格行为。
     on_error='skip'：单只拉取失败时打印警告并跳过，适合成分股大池（个别退市票不应拖垮整体）。
     """
-    fields = ["open", "high", "low", "close", "volume"]
+    fields = ["open", "high", "low", "close", "volume", "amount", "outstanding_share"]
     panels = {f: {} for f in fields}
     for code in codes:
         code = str(code).zfill(6)  # 统一 6 位，保证 dict key 与缓存文件名一致

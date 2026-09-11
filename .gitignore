@@ -52,6 +52,11 @@ daily_*.html
 *_rolling_curve.csv
 *_rolling_metrics.csv
 *_combine_equity.csv
+# 样本外验证 / 因子有效性（P1 新增的输出）
+*_wf_folds.csv
+*_wf_summary.csv
+*_wf_report.html
+*_factor_eval.html
 
 # ---------- 用户私有 ----------
 my_holdings*.csv
