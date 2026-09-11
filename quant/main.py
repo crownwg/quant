@@ -851,13 +851,22 @@ def main() -> None:
                       f"搜索空间 {res['n_combos']} 组 · "
                       f"全样本最优 {res['full_best_label']}"))
         print("\n【样本外表现对比】")
+        sm_ = res["summary"].set_index("key")
+        base_ret = float(sm_.loc["walk_forward", "total_return"])
         for _, r in res["summary"].iterrows():
-            print(f"  {r['strategy']:<26s} 总收益 {r['total_return']:>7.1%}"
+            delta = (f"  vs argmax {r['total_return'] - base_ret:>+7.1%}"
+                     if r.get("key") in ("smooth", "ensemble") else " " * 18)
+            print(f"  {r['strategy']:<28s} 总收益 {r['total_return']:>7.1%}"
                   f" 年化 {r['annual_return']:>6.1%} 平均夏普 {r['avg_sharpe']:>5.2f}"
-                  f" 正收益折 {r['positive_folds']:.0%}")
-        gap = (res["summary"].iloc[1]["total_return"] - res["summary"].iloc[0]["total_return"])
-        print(f"\n  事后选参 vs 自适应选参 差距：{gap:+.1%}"
+                  f" 正收益折 {r['positive_folds']:.0%}{delta}")
+        gap = float(sm_.loc["full_sample_best", "total_return"]) - base_ret
+        print(f"\n  事后选参 vs 自适应选参（argmax）差距：{gap:+.1%}"
               + ("（事后选参高估，说明参数在拟合噪声）" if gap > 0.02 else "（差距不大）"))
+        best_nosel = max(float(sm_.loc[k, "total_return"]) for k in ("smooth", "ensemble")
+                         if k in sm_.index)
+        d_nosel = best_nosel - base_ret
+        print(f"  不踩尖峰（邻域平滑 / 全组合集成）最好的一条 vs argmax：{d_nosel:+.1%}"
+              + ("（正则说明 argmax 挑到的主要是噪声）" if d_nosel > 0.005 else "（选参方式差别不大）"))
         if res.get("timing_note"):
             print(f"  {res['timing_note']}")
             print("  ——频繁选中 off 说明择时参数没有稳定信息；频繁选中某个模式"

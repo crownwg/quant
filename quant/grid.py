@@ -163,6 +163,114 @@ def _exposure_getter(proxy: pd.Series | None, prices_all: pd.DataFrame, args,
     return get
 
 
+# ============================================================ 参数集成
+#
+# 为什么要做参数集成
+# ----------------
+# walk-forward 的「训练窗取 argmax」有个致命弱点：**argmax 永远挑到那个尖峰**，
+# 而尖峰多半是噪声。实测（消费池 2026-09 那轮）5 折选中的滞回带 0 与 2% 各占一半——
+# 说明这一维根本没有信息，argmax 只是在两枚硬币里挑正面的那枚。
+#
+# 两种不做单点择优的替代：
+#   1. **邻域平滑选参**：先在参数曲面上做一次均值滤波（每个点取「自己+相邻档」的
+#      训练期均值），再取 argmax。等价于「不选最高点，选最高的那一片区域」，
+#      把孤立尖峰自然抹掉。选参范式不变，只是不再踩尖峰。
+#   2. **全组合等权集成**：干脆不选，把所有候选的权重等权平均后一起持有。
+#      这是「承认自己不知道哪个参数对」的诚实做法，代价是收益被摊薄。
+#
+# 两者都是纯增量：不改变原有 walk-forward 口径，只在报告里多两条对照曲线。
+
+
+def _neighbor_map(combos: list[dict], lookbacks: list[int], top_ns: list[int],
+                  buffers: list[int], timing_lookbacks: list[int] | None,
+                  timing_bands: list[float] | None) -> list[list[int]]:
+    """为每个 combo 找出「参数空间邻域」的下标列表（含自身）。
+
+    邻域定义
+    --------
+    - 选股三维（lookback / top_n / buffer）：候选序列上**相差不超过 1 档**；
+    - 择时模式必须相同（off 只和 off 相邻——跨模式不是「相邻」，是「换了个方法」）；
+    - 择时两维（窗口 / 滞回带）同样相差不超过 1 档。
+
+    即 3×3×3 的立方体邻域（择时维度上再乘一个 3×3）。这样邻域均值就是参数曲面上的
+    一次均值滤波：孤立的尖峰会被邻居拉下来，而**成片的高原**会被保留——
+    我们要的正是「哪一片参数区域整体好」，不是「哪个点最高」。
+    """
+    stock_dims = [lookbacks, top_ns, buffers]
+    stock_keys = ["lookback", "top_n", "buffer"]
+    timing_dims = [list(timing_lookbacks or []), list(timing_bands or [])]
+    timing_keys = ["timing_lookback", "timing_band"]
+
+    def _pos(dims: list, v):
+        try:
+            return dims.index(v)
+        except ValueError:
+            return -10 ** 6          # 该维度不在候选里 → 与谁都不相邻
+
+    stock = [tuple(_pos(stock_dims[k], c[stock_keys[k]]) for k in range(3))
+             for c in combos]
+    is_off = [(c.get("timing") or "off").strip().lower() in ("", "off", "none")
+              for c in combos]
+    timing = [None if is_off[i] else
+              tuple(_pos(timing_dims[k], combos[i][timing_keys[k]]) for k in range(2))
+              for i in range(len(combos))]
+
+    nbrs: list[list[int]] = []
+    for i in range(len(combos)):
+        grp = []
+        for j in range(len(combos)):
+            if any(abs(a - b) > 1 for a, b in zip(stock[i], stock[j])):
+                continue
+            if is_off[i] != is_off[j]:
+                continue
+            if not is_off[i]:
+                if combos[i]["timing"] != combos[j]["timing"]:
+                    continue
+                if any(abs(a - b) > 1 for a, b in zip(timing[i], timing[j])):
+                    continue
+            grp.append(j)
+        nbrs.append(grp)
+    return nbrs
+
+
+def smooth_scores(scores: list[float], neighbors: list[list[int]]) -> list[float]:
+    """在参数曲面上对分数做邻域均值（含自身）。纯函数，便于单测。
+
+    这是「不踩尖峰」的实现核心：argmax(smooth_scores) 选的是**局部区域均值最高**
+    的那一组，而不是单点最高。若某点分数略高但四周都平庸，平滑后它会输给一片
+    整体都不错的「高原」。
+
+    ⚠️ 能抹平的幅度有限：邻域窗口每维只有 3 档，自身占 1/2~1/3 权重，
+    所以只在「尖峰幅度和邻居差得不多」时生效（而这正是参数选择里最常见的情形：
+    0.42 vs 0.40 这种量级的抖动）。若某组参数的样本内分数是邻居的 50 倍，
+    那属于**异常值**而不是稳健性问题，均值滤波拉不下来——那种情况该查的是
+    指标计算或数据，而不是选参方式。
+    """
+    out = []
+    for i, s in enumerate(scores):
+        vals = [float(scores[j]) for j in neighbors[i]] if neighbors[i] else [float(s)]
+        out.append(float(np.mean(vals)) if vals else float(s))
+    return out
+
+
+def ensemble_weights(weight_list: list[pd.DataFrame]) -> pd.DataFrame:
+    """把多个参数组合的权重矩阵等权平均 —— 「同时按所有候选参数持有」。
+
+    为什么是**平均权重**而不是「平均各条净值曲线」：前者对应真实的执行
+    （一笔净额委托，只付一次成本），后者要 N 份资金各付一遍成本，
+    既不可实现也会把成本重复计算。
+    """
+    if not weight_list:
+        raise ValueError("ensemble_weights 需要非空的权重列表")
+    if len(weight_list) == 1:
+        return weight_list[0]
+    base = weight_list[0]
+    mean = pd.concat(weight_list).groupby(level=0).mean()
+    # groupby 会把 DatetimeIndex 的 freq 抹掉、也不保证列序，这里对齐回原始索引/列序，
+    # 让集成权重与单个组合的权重矩阵形状完全可比（下游 run() 依赖两者的索引一致）。
+    return mean.reindex(index=base.index, columns=base.columns)
+
+
 def grid_search(prices_all: pd.DataFrame, open_all: pd.DataFrame,
                 can_buy, can_sell, args,
                 lookbacks: list[int], top_ns: list[int], buffers: list[int],
@@ -295,11 +403,18 @@ def walk_forward_search(prices_all: pd.DataFrame, open_all: pd.DataFrame,
     """滚动训练/测试的样本外验证。
 
     返回 dict：
-      folds      每折明细 DataFrame（含训练期最优参数与其样本内/样本外表现）
-      curves     {'walk_forward'|'full_sample_best'|'default': 测试期拼接净值}
-      summary    三者的汇总指标 DataFrame
-      chosen     每折选中的参数
-      timing_note 各折选中的择时模式统计（搜索空间含 off 时才有意义）
+      folds      每折明细 DataFrame（含三种选参方式的选中参数与样本外表现）
+      curves     五条测试期拼接净值：walk_forward(训练窗 argmax) / smooth(邻域平滑)
+                 / ensemble(全组合等权集成) / full_sample_best(事后选参) / default(不调参)
+      summary    五条曲线的汇总指标 DataFrame（带 key 列，报告按 key 取用）
+      timing_note    各折选中的择时模式统计（搜索空间含 off 时才有意义）
+      ensemble_note  平滑/集成相对 argmax 的改善——「别踩尖峰」的直接证据
+
+    为什么要加 smooth / ensemble 两条
+    ---------------------------------
+    argmax 永远挑到那个尖峰，而尖峰多半是噪声（实测滞回带 0 与 2% 各折各半）。
+    邻域平滑把参数曲面抹一遍再取最高（选「最好的一片」），集成干脆不选。
+    这两条不需要任何额外假设，却能把「选择本身带来了多少虚假优势」量化出来。
 
     特别提醒：若 timing_modes 非空，搜索空间里会强制包含「不择时」。
     这样「择时参数是不是拟合出来的」才有答案——如果各折频繁选中 ma，
@@ -323,21 +438,25 @@ def walk_forward_search(prices_all: pd.DataFrame, open_all: pd.DataFrame,
     search_timing = bool(timing_modes)
     combos = build_combos(lookbacks, top_ns, buffers,
                           timing_modes, timing_lookbacks, timing_bands)
-    score_cache = {lb: factors.momentum(prices_all, lb, getattr(args, "skip_recent", 0))
-                   for lb in dict.fromkeys(c["lookback"] for c in combos)}
+    # 打分缓存按需惰性填充：不能再假定「用到的 lookback 都在网格候选里」——
+    # 默认对照组用的是 args.lookback，它完全可以不在 --grid-lookbacks 里
+    # （如 --grid-lookbacks 60,90 而 --lookback 默认 120），预先按网格建缓存会 KeyError。
+    score_cache: dict[int, pd.DataFrame] = {}
+
+    def score_of(lb: int) -> pd.DataFrame:
+        if lb not in score_cache:
+            score_cache[lb] = factors.momentum(
+                prices_all, lb, getattr(args, "skip_recent", 0))
+        return score_cache[lb]
+
     get_exposure = _exposure_getter(proxy, prices_all, args, fallback=exposure,
                                    search_timing=search_timing)
     cost = cost_kwargs(args)
 
-    def run_combo(combo, end_pos, lo, hi):
-        """在 [lo, hi) 上跑 combo，权重只用 < hi 的数据计算（无前视）。
-
-        end_pos 是「权重允许看到的数据边界」，恒等于本折测试窗的终点；
-        训练窗与测试窗都用它，因此两窗的选股/择时口径完全一致，
-        差别只在回测区间 [lo, hi)。
-        """
-        sc = score_cache[combo["lookback"]].iloc[:end_pos]
-        w = weights_from_args(
+    def build_weights(combo, end_pos):
+        """combo 在「只用 < end_pos 的数据」下算出的目标权重（整段前程，便于切片）。"""
+        sc = score_of(combo["lookback"]).iloc[:end_pos]
+        return weights_from_args(
             sc, args,
             can_buy=(can_buy.iloc[:end_pos] if can_buy is not None else None),
             can_sell=(can_sell.iloc[:end_pos] if can_sell is not None else None),
@@ -345,11 +464,21 @@ def walk_forward_search(prices_all: pd.DataFrame, open_all: pd.DataFrame,
             weight_cap=(weight_cap.iloc[:end_pos] if weight_cap is not None else None),
             exposure=get_exposure(combo, end_pos),
             top_n=combo["top_n"], buffer=combo["buffer"])
-        w = w.iloc[lo:hi]
+
+    def run_weights(w, lo, hi):
         p = prices_all.iloc[lo:hi]
         o = open_all.iloc[lo:hi] if getattr(args, "use_open", False) else None
-        eq, m, _ = run(p, w, open_prices=o, **cost)
+        eq, m, _ = run(p, w.iloc[lo:hi], open_prices=o, **cost)
         return eq, m
+
+    def run_combo(combo, end_pos, lo, hi):
+        """在 [lo, hi) 上跑 combo，权重只用 < end_pos 的数据计算（无前视）。
+
+        end_pos 是「权重允许看到的数据边界」，恒等于本折测试窗的终点；
+        训练窗与测试窗都用它，因此两窗的选股/择时口径完全一致，
+        差别只在回测区间 [lo, hi)。
+        """
+        return run_weights(build_weights(combo, end_pos), lo, hi)
 
     default_combo = {
         "lookback": int(getattr(args, "lookback", 120)),
@@ -359,6 +488,10 @@ def walk_forward_search(prices_all: pd.DataFrame, open_all: pd.DataFrame,
         "timing_lookback": int(getattr(args, "timing_lookback", 120) or 0),
         "timing_band": float(getattr(args, "timing_band", 0.0) or 0.0),
     }
+
+    # 参数空间邻域：用于「邻域平滑选参」（不踩尖峰）
+    neighbors = _neighbor_map(combos, lookbacks, top_ns, buffers,
+                             timing_lookbacks, timing_bands)
 
     # ---- 对照组 A：全样本事后选参 ----
     print(f"  [对照组] 全样本网格 {len(combos)} 组，用于对比「事后选参」的幻觉")
@@ -375,23 +508,30 @@ def walk_forward_search(prices_all: pd.DataFrame, open_all: pd.DataFrame,
     print(f"\n【Walk-Forward】{len(folds)} 折，训练 {train_n} 日 / 测试 {test_n} 日"
           f"（选参依据：训练期 {select_metric}）")
     fold_rows = []
-    curves = {"walk_forward": [], "full_sample_best": [], "default": []}
+    arms = ("walk_forward", "smooth", "ensemble", "full_sample_best", "default")
+    curves: dict[str, list] = {k: [] for k in arms}
     for fi, (s, se, te) in enumerate(folds, 1):
-        best = None
-        for combo in combos:
-            _, m_tr = run_combo(combo, se, s, se)
-            if best is None or m_tr[select_metric] > best[1][select_metric]:
-                best = (combo, m_tr)
-        wf_combo, wf_train_m = best
+        # 训练窗：把所有候选都跑一遍（后面 argmax / 邻域平滑 / 集成都要用）
+        train_ms = [run_combo(combo, se, s, se)[1] for combo in combos]
+        scores = [float(m[select_metric]) for m in train_ms]
+
+        best_i = int(np.argmax(scores))
+        wf_combo, wf_train_m = combos[best_i], train_ms[best_i]
+        sm_i = int(np.argmax(smooth_scores(scores, neighbors)))
+        sm_combo, sm_train_m = combos[sm_i], train_ms[sm_i]
 
         _, m_wf = run_combo(wf_combo, te, se, te)
-        eq_fb, m_fb = run_combo(full_best_combo, te, se, te)
-        eq_df, m_df = run_combo(default_combo, te, se, te)
+        _, m_sm = run_combo(sm_combo, te, se, te)
+        # 集成臂：所有候选的权重等权平均 → 一笔净额委托（成本只算一次）
+        w_ens = ensemble_weights([build_weights(c, te) for c in combos])
+        _, m_en = run_weights(w_ens, se, te)
+        _, m_fb = run_combo(full_best_combo, te, se, te)
+        _, m_df = run_combo(default_combo, te, se, te)
 
         # 记录测试期的净值（后续按年化收益拼接成连续曲线）
-        curves["walk_forward"].append((se, te, m_wf["sharpe"], m_wf["total_return"], m_wf["max_drawdown"]))
-        curves["full_sample_best"].append((se, te, m_fb["sharpe"], m_fb["total_return"], m_fb["max_drawdown"]))
-        curves["default"].append((se, te, m_df["sharpe"], m_df["total_return"], m_df["max_drawdown"]))
+        for key, m in (("walk_forward", m_wf), ("smooth", m_sm), ("ensemble", m_en),
+                       ("full_sample_best", m_fb), ("default", m_df)):
+            curves[key].append((se, te, m["sharpe"], m["total_return"], m["max_drawdown"]))
 
         fold_rows.append({
             "fold": fi,
@@ -403,18 +543,23 @@ def walk_forward_search(prices_all: pd.DataFrame, open_all: pd.DataFrame,
             "timing_lookback": wf_combo.get("timing_lookback", 0),
             "timing_band": wf_combo.get("timing_band", 0.0),
             "chosen": combo_label(wf_combo),
+            "smooth_chosen": combo_label(sm_combo),
             "train_sharpe": round(float(wf_train_m["sharpe"]), 3),
             "train_return": round(float(wf_train_m["total_return"]), 4),
             "test_sharpe": round(float(m_wf["sharpe"]), 3),
             "test_return": round(float(m_wf["total_return"]), 4),
             "test_max_drawdown": round(float(m_wf["max_drawdown"]), 4),
             "decay": round(float(m_wf["sharpe"] - wf_train_m["sharpe"]), 3),
+            "test_return_smooth": round(float(m_sm["total_return"]), 4),
+            "test_return_ensemble": round(float(m_en["total_return"]), 4),
         })
         print(f"  第{fi}折 {idx_all[s].date()}~{idx_all[se-1].date()} 选参"
               f" {combo_label(wf_combo)}"
               f" | 样本内夏普 {wf_train_m['sharpe']:.2f} → 样本外 {m_wf['sharpe']:.2f}"
               f"（衰减 {fold_rows[-1]['decay']:+.2f}）"
-              f" | 样本外收益 {m_wf['total_return']:.1%}", flush=True)
+              f" | 样本外收益 argmax {m_wf['total_return']:.1%}"
+              f" / 邻域 {m_sm['total_return']:.1%}"
+              f" / 集成 {m_en['total_return']:.1%}", flush=True)
 
     folds_df = pd.DataFrame(fold_rows)
 
@@ -433,7 +578,9 @@ def walk_forward_search(prices_all: pd.DataFrame, open_all: pd.DataFrame,
         return eq
 
     summary_rows = []
-    for key, label in (("walk_forward", "Walk-Forward 自适应参数"),
+    for key, label in (("walk_forward", "Walk-Forward 自适应参数（训练窗 argmax）"),
+                       ("smooth", "Walk-Forward 邻域平滑选参（不踩尖峰）"),
+                       ("ensemble", "参数集成（全组合等权持有，不做选择）"),
                        ("full_sample_best", "全样本最优固定参数（事后选参）"),
                        ("default", "默认参数（不调参）")):
         recs = curves[key]
@@ -447,6 +594,7 @@ def walk_forward_search(prices_all: pd.DataFrame, open_all: pd.DataFrame,
         w_sharpe = float(np.average([r[2] for r in recs], weights=days)) if days else 0.0
         worst_dd = float(min(r[4] for r in recs)) if recs else 0.0
         summary_rows.append({
+            "key": key,
             "strategy": label,
             "total_return": total,
             "annual_return": ann,
@@ -458,6 +606,23 @@ def walk_forward_search(prices_all: pd.DataFrame, open_all: pd.DataFrame,
 
     summary_df = pd.DataFrame(summary_rows)
 
+    # ---- 集成/平滑相对 argmax 的改善（若有，就是「别踩尖峰」的直接证据）----
+    ensemble_note = ""
+    if summary_df is not None and len(summary_df):
+        by_key = summary_df.set_index("key")
+        try:
+            d_arg = by_key.loc["walk_forward", "total_return"]
+            parts = []
+            for k, name in (("smooth", "邻域平滑"), ("ensemble", "全组合集成")):
+                if k in by_key.index:
+                    dd = float(by_key.loc[k, "total_return"]) - float(d_arg)
+                    parts.append(f"{name} {dd:+.1%}")
+            if parts:
+                ensemble_note = ("样本外总收益相对「训练窗 argmax」的变化：" + "，".join(parts)
+                                 + "（正则说明单点择优确实在踩噪声）")
+        except KeyError:
+            ensemble_note = ""
+
     return {
         "folds": folds_df,
         "summary": summary_df,
@@ -467,6 +632,7 @@ def walk_forward_search(prices_all: pd.DataFrame, open_all: pd.DataFrame,
         "full_best_label": combo_label(full_best_combo),
         "default_label": combo_label(default_combo),
         "timing_note": timing_note,
+        "ensemble_note": ensemble_note,
         "search_timing": search_timing,
         "n_combos": len(combos),
         "train_n": train_n,
@@ -520,8 +686,11 @@ _WF_TEMPLATE = """<!DOCTYPE html>
     <h2>样本外测试期拼接净值（各折连乘）</h2>
     <div class="chart" id="curves"></div>
     <div class="note">只看<b>测试期</b>——训练期不参与画图。
-      若「全样本最优固定参数」明显高于「Walk-Forward 自适应」，
-      说明那组最优参数吃的是样本内的运气，实盘拿不到。</div>
+      若「全样本最优固定参数」明显高于三条自适应曲线，
+      说明那组最优参数吃的是样本内的运气，实盘拿不到。<br/>
+      自适应里有三条：<b>argmax</b>（训练窗取最高分）、<b>邻域平滑</b>（取最高的那一片而非最高点）、
+      <b>全组合集成</b>（压根不选，所有候选等权持有）。
+      如果后两条稳定胜过 argmax，说明「选最高分」本身就是在踩噪声。</div>
   </div>
 
   <div class="group">
@@ -534,13 +703,16 @@ _WF_TEMPLATE = """<!DOCTYPE html>
   <div class="group">
     <h2>汇总对比</h2>
     <table id="summary"></table>
-    <div class="note">「正收益折占比」= 测试窗里赚钱的比例，衡量方法在时间上的稳定性。</div>
+    <div class="note">「正收益折占比」= 测试窗里赚钱的比例，衡量方法在时间上的稳定性。
+      「vs argmax」列 = 该条曲线相对「训练窗取最高分」的样本外总收益差。</div>
   </div>
 
   <div class="group">
     <h2>逐折明细</h2>
     <table id="folds"></table>
-    <div class="note">decay = 测试期夏普 − 训练期夏普。<span id="timing-note"></span></div>
+    <div class="note">decay = 测试期夏普 − 训练期夏普。最后三列对比同一折里
+      三种选参方式的样本外收益——它们看的是<b>同一段测试窗</b>，差别只来自怎么选参数。
+      <span id="timing-note"></span></div>
   </div>
 </div>
 <script>
@@ -549,38 +721,51 @@ const axisCommon = { axisLine:{lineStyle:{color:'#e6e6e6'}}, axisLabel:{color:'#
 
 // 卡片
 const cards = document.getElementById('cards');
-const wf = DATA.summary.find(s => s.key === 'walk_forward');
-const fb = DATA.summary.find(s => s.key === 'full_sample_best');
-const df = DATA.summary.find(s => s.key === 'default');
+const pick = k => DATA.summary.find(s => s.key === k) || {total_return:0,annual_return:0,avg_sharpe:0,positive_folds:0,folds:0};
+const wf = pick('walk_forward'), sm = pick('smooth'), en = pick('ensemble');
+const fb = pick('full_sample_best'), df = pick('default');
 const card = (label, v, hint) => `<div class="card"><span>${label}</span><b>${v}</b>` +
   (hint ? `<span>${hint}</span>` : '') + '</div>';
 cards.innerHTML =
-  card('Walk-Forward 样本外总收益', (wf.total_return*100).toFixed(1)+'%',
+  card('Walk-Forward argmax 选参', (wf.total_return*100).toFixed(1)+'%',
        '年化 '+(wf.annual_return*100).toFixed(1)+'% · 平均夏普 '+wf.avg_sharpe.toFixed(2)) +
+  card('邻域平滑选参', (sm.total_return*100).toFixed(1)+'%',
+       '不选最高点、选最高的那一片 · 夏普 '+sm.avg_sharpe.toFixed(2)) +
+  card('全组合集成（不选）', (en.total_return*100).toFixed(1)+'%',
+       '所有候选等权持有 · 夏普 '+en.avg_sharpe.toFixed(2)) +
   card('全样本最优（事后选参）', (fb.total_return*100).toFixed(1)+'%',
-       DATA.full_best_label || '同期对照，高于 WF 的部分是幻觉') +
+       DATA.full_best_label || '同期对照，高于前三条的部分是幻觉') +
   card('默认参数（不调参）', (df.total_return*100).toFixed(1)+'%',
-       DATA.default_label || '不调参的基准线') +
-  card('正收益折占比', (wf.positive_folds*100).toFixed(0)+'%', wf.folds+' 折测试窗');
+       DATA.default_label || '不调参的基准线');
 
 const gap = fb.total_return - wf.total_return;
-document.getElementById('verdict').innerHTML = gap > 0.05
+const better = Math.max(sm.total_return, en.total_return) - wf.total_return;
+let verdict = gap > 0.05
   ? `<b>⚠️ 事后选参高估了 ${(gap*100).toFixed(1)} 个百分点</b>——全样本最优参数在样本外明显跑输自适应选参，说明调参过程在拟合噪声。`
   : `全样本最优与自适应选参差距 ${(gap*100).toFixed(1)} 个百分点，参数对样本外的影响有限。`;
+if (better > 0.005) {
+  verdict += `<br/><b>不踩尖峰更赚</b>：邻域平滑 / 全组合集成里最好的那条比 argmax 选参高出 ${(better*100).toFixed(1)} 个百分点——`
+           + `这直接说明「训练窗取最高分」挑到的大概率是噪声，而不是真实优势。`;
+}
+document.getElementById('verdict').innerHTML = verdict + (DATA.ensemble_note ? '<br/>' + DATA.ensemble_note : '');
 
 // 净值曲线
 const cv = echarts.init(document.getElementById('curves'));
-const names = {walk_forward:'Walk-Forward 自适应', full_sample_best:'全样本最优固定', default:'默认参数'};
-const colors = {walk_forward:'#cf1322', full_sample_best:'#fadb14', default:'#8c8c8c'};
+const ORDER = ['walk_forward','smooth','ensemble','full_sample_best','default'];
+const names = {walk_forward:'WF argmax 选参', smooth:'WF 邻域平滑',
+               ensemble:'全组合集成', full_sample_best:'全样本最优固定', default:'默认参数'};
+const colors = {walk_forward:'#cf1322', smooth:'#fa8c16', ensemble:'#2f6df0',
+                full_sample_best:'#8c8c8c', default:'#bfbfbf'};
+const widths  = {walk_forward:2.4, smooth:2.2, ensemble:2.6, full_sample_best:1.6, default:1.4};
 cv.setOption({
   tooltip:{ trigger:'axis' },
-  legend:{ top:0, data:Object.keys(names).map(k=>names[k]) },
+  legend:{ top:0, data:ORDER.map(k=>names[k]) },
   grid:{ left:60, right:30, top:40, bottom:50 },
   xAxis:{ type:'category', data:DATA.eq_x, axisLabel:{ fontSize:10, color:'#6b7280' }, name:'交易日（仅测试窗）' },
   yAxis:{ type:'value', name:'净值', ...axisCommon },
-  series: Object.keys(names).map(k => ({
+  series: ORDER.filter(k => DATA.eq[k]).map(k => ({
     name:names[k], type:'line', showSymbol:false, smooth:true,
-    lineStyle:{ width:2, color:colors[k] }, itemStyle:{ color:colors[k] },
+    lineStyle:{ width:widths[k], color:colors[k] }, itemStyle:{ color:colors[k] },
     data: DATA.eq[k]
   }))
 });
@@ -603,24 +788,31 @@ dc.setOption({
 
 // 汇总表
 const pct = v => `<td class="${v>=0?'pos':'neg'}">${(v*100).toFixed(2)}%</td>`;
-let sh = '<tr><th>参数策略</th><th>样本外总收益</th><th>年化</th><th>平均夏普</th><th>最差折回撤</th><th>正收益折占比</th><th>折数</th></tr>';
+const cnote = v => v > 0.005 ? '（优于 argmax）' : (v < -0.005 ? '（差于 argmax）' : '');
+const argmaxRet = (DATA.summary.find(s=>s.key==='walk_forward')||{total_return:0}).total_return;
+let sh = '<tr><th>参数策略</th><th>样本外总收益</th><th>vs argmax</th><th>年化</th><th>平均夏普</th><th>最差折回撤</th><th>正收益折占比</th><th>折数</th></tr>';
 DATA.summary.forEach(s => {
-  sh += `<tr><td>${s.label}</td>${pct(s.total_return)}${pct(s.annual_return)}
+  const d = s.total_return - argmaxRet;
+  const extra = (s.key === 'smooth' || s.key === 'ensemble')
+    ? `<td class="${d>=0?'pos':'neg'}">${d>=0?'+':''}${(d*100).toFixed(2)}%${cnote(d)}</td>` : '<td>—</td>';
+  sh += `<tr><td>${s.label}</td>${pct(s.total_return)}${extra}${pct(s.annual_return)}
     <td>${s.avg_sharpe.toFixed(3)}</td>${pct(s.worst_fold_drawdown)}
     <td>${(s.positive_folds*100).toFixed(0)}%</td><td>${s.folds}</td></tr>`;
 });
 document.getElementById('summary').innerHTML = sh;
 
 // 逐折表
-let fh = '<tr><th>折</th><th>训练期</th><th>测试期</th><th>选中参数</th>' +
-         '<th>训练夏普</th><th>测试夏普</th><th>衰减</th><th>测试收益</th><th>测试回撤</th></tr>';
+let fh = '<tr><th>折</th><th>训练期</th><th>测试期</th><th>argmax 选中参数</th>' +
+         '<th>训练夏普</th><th>测试夏普</th><th>衰减</th><th>测试收益</th><th>测试回撤</th>' +
+         '<th>邻域平滑选中</th><th>平滑收益</th><th>集成收益</th></tr>';
 DATA.folds.forEach(f => {
   fh += `<tr><td>${f.fold}</td><td>${f.train_start}~${f.train_end}</td>
     <td>${f.test_start}~${f.test_end}</td>
     <td>${f.chosen}</td>
     <td>${f.train_sharpe.toFixed(2)}</td><td>${f.test_sharpe.toFixed(2)}</td>
     <td class="${f.decay>=0?'pos':'neg'}">${f.decay>=0?'+':''}${f.decay.toFixed(2)}</td>
-    ${pct(f.test_return)}${pct(f.test_max_drawdown)}</tr>`;
+    ${pct(f.test_return)}${pct(f.test_max_drawdown)}
+    <td>${f.smooth_chosen || '—'}</td>${pct(f.test_return_smooth)}${pct(f.test_return_ensemble)}</tr>`;
 });
 document.getElementById('folds').innerHTML = fh;
 document.getElementById('timing-note').textContent = DATA.timing_note || '';
@@ -654,7 +846,7 @@ def build_wf_report(res: dict, out_html: str, title: str = "样本外验证（Wa
     # 拼接净值的横轴：按折数展开（每折天数不同，这里用折内序号表示）
     eq = {}
     max_len = 0
-    for key in ("walk_forward", "full_sample_best", "default"):
+    for key in curves:
         vals, cur = [], 1.0
         for _, _, _, ret, _ in curves[key]:
             cur *= (1 + ret)
@@ -666,10 +858,9 @@ def build_wf_report(res: dict, out_html: str, title: str = "样本外验证（Wa
             eq[key].append(eq[key][-1])
 
     summary_payload = []
-    for key, row in zip(("walk_forward", "full_sample_best", "default"),
-                        res["summary"].to_dict("records")):
+    for row in res["summary"].to_dict("records"):
         summary_payload.append({
-            "key": key,
+            "key": row.get("key", ""),
             "label": str(row["strategy"]),
             "total_return": float(row["total_return"]),
             "annual_return": float(row["annual_return"]),
@@ -685,6 +876,7 @@ def build_wf_report(res: dict, out_html: str, title: str = "样本外验证（Wa
         "eq_x": [f"第{i+1}折" for i in range(max_len)],
         "eq": eq,
         "timing_note": res.get("timing_note", ""),
+        "ensemble_note": res.get("ensemble_note", ""),
         "full_best_label": res.get("full_best_label", ""),
         "default_label": res.get("default_label", ""),
     }

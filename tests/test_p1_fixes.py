@@ -469,14 +469,21 @@ def test_walk_forward_rejects_too_short_windows():
                                  pd.Timestamp(p.index[0]), train_years=0.1, test_years=0.02)
 
 
-def test_walk_forward_runs_and_reports_three_strategies():
+def test_walk_forward_runs_and_reports_all_arms():
+    """walk-forward 必须给出全部对照组：两条选参方式 + 不选参的集成 + 事后选参 + 不调参。
+
+    为什么是 5 条而不是最初 3 条：实测「训练窗取 argmax」挑到的多半是噪声
+    （滞回带 0 与 2% 各折各半），所以补了「邻域平滑」与「全组合集成」两条不做
+    单点择优的对照——没有它们就分不清「参数有效」和「选择本身带来的虚假优势」。
+    """
     p = _prices(n_days=1500, n_codes=10, seed=11)
     args = _Args(use_open=False)
     res = grid.walk_forward_search(p, p, None, None, args, [60, 120], [3, 5], [0],
                                    pd.Timestamp(p.index[0]), train_years=2, test_years=0.5)
     assert len(res["folds"]) >= 2
-    assert set(res["summary"]["strategy"]) == {
-        "Walk-Forward 自适应参数", "全样本最优固定参数（事后选参）", "默认参数（不调参）"}
+    assert list(res["summary"]["key"]) == [
+        "walk_forward", "smooth", "ensemble", "full_sample_best", "default"]
+    assert set(res["curves"]) == set(res["summary"]["key"])
     # 每一折都必须给出训练期与测试期两套指标
     for _, r in res["folds"].iterrows():
         assert "train_sharpe" in r and "test_sharpe" in r
