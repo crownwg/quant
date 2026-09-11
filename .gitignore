@@ -1,0 +1,78 @@
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+dist/
+build/
+*.whl
+
+# ---------- 虚拟环境 ----------
+.venv/
+venv/
+env/
+ENV/
+
+# ---------- 缓存的股票/指数数据 ----------
+# data/ 里是 akshare 拉下来的日线 CSV 和成分股缓存，几百 MB，
+# 公开仓库不要上传。新 clone 后跑命令会自动重新拉取。
+data/
+!data/.gitkeep
+
+# ---------- 回测临时输出（一次性 CSV/HTML）----------
+web_*.csv
+today_*.csv
+today_*.html
+attr_*.csv
+attr_*.html
+grid_*.csv
+grid_*.html
+cmp*.csv
+cmp*.html
+cmb*.csv
+cmb*.html
+roll_*.csv
+roll_*.html
+daily_*.html
+*_today_plan.csv
+*_rebalance_plan.csv
+*_annual_metrics.csv
+*_equity_curve.csv
+*_benchmark_curve.csv
+*_metrics.csv
+*_daily_detail.csv
+*_report.html
+*_grid_report.html
+*_compare_report.html
+*_combine_report.html
+*_combine_correlation.csv
+*_attribution.csv
+*_rolling_curve.csv
+*_rolling_metrics.csv
+*_combine_equity.csv
+
+# ---------- 用户私有 ----------
+my_holdings*.csv
+daily*.json
+
+# ---------- IDE / 编辑器 ----------
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ---------- 日志 / 环境 ----------
+*.log
+.env
+.env.local
+.env.*.local
+
+# ---------- 工具产物 ----------
+.coverage
+htmlcov/
+.pytest_cache/
+.mypy_cache/

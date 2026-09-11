@@ -1,0 +1,642 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>量化回测 · 控制台</title>
+<script src="https://cdn.jsdelivr.net/npm/echarts@5.4.3/dist/echarts.min.js"></script>
+<style>
+  :root {
+    --bg: #0e1525;
+    --surface: #18233a;
+    --surface-2: #20304d;
+    --border: #2c3d5e;
+    --text: #e6ecf5;
+    --muted: #8b9bbd;
+    --accent: #f5a623;
+    --green: #16c060;
+    --red: #ef4146;
+    --blue: #4a9cf6;
+    --purple: #b27df9;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    font-size: 14px;
+  }
+  header {
+    padding: 18px 28px;
+    border-bottom: 1px solid var(--border);
+    background: linear-gradient(90deg, #18233a 0%, #1c2a47 100%);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  header h1 { margin: 0; font-size: 18px; font-weight: 600; letter-spacing: 0.5px; }
+  header .badge {
+    font-size: 12px; color: var(--muted);
+    padding: 4px 10px; border: 1px solid var(--border); border-radius: 12px;
+  }
+
+  /* 主布局 */
+  main {
+    display: grid;
+    grid-template-columns: 320px 1fr;
+    gap: 16px;
+    padding: 16px 24px 24px;
+    max-width: 1600px;
+    margin: 0 auto;
+  }
+  @media (max-width: 900px) {
+    main { grid-template-columns: 1fr; }
+  }
+
+  /* 左侧表单栏 */
+  .panel {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 18px;
+    position: sticky;
+    top: 16px;
+    align-self: start;
+    max-height: calc(100vh - 32px);
+    overflow-y: auto;
+  }
+  .panel h2 { margin: 0 0 14px; font-size: 14px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 1px; }
+  .field { margin-bottom: 14px; }
+  .field label { display: block; margin-bottom: 6px; color: var(--muted); font-size: 12px; }
+  .field input, .field select {
+    width: 100%;
+    padding: 8px 10px;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
+    font-size: 13px;
+    font-family: inherit;
+  }
+  .field input:focus, .field select:focus {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 2px rgba(245, 166, 35, 0.15);
+  }
+  .field-row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .check {
+    display: flex; align-items: center; gap: 8px;
+    color: var(--muted); font-size: 13px;
+  }
+  .check input { width: 16px; height: 16px; }
+  .btn {
+    width: 100%;
+    padding: 12px;
+    background: linear-gradient(90deg, var(--accent), #ff7d3b);
+    color: #1a1a1a;
+    border: none;
+    border-radius: 6px;
+    font-size: 14px;
+    font-weight: 700;
+    cursor: pointer;
+    transition: transform 0.1s, box-shadow 0.1s;
+  }
+  .btn:hover:not(:disabled) { transform: translateY(-1px); box-shadow: 0 4px 12px rgba(245, 166, 35, 0.3); }
+  .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+  details { margin-bottom: 14px; }
+  details summary {
+    cursor: pointer; color: var(--muted); font-size: 12px;
+    padding: 6px 0;
+  }
+  details summary:hover { color: var(--accent); }
+  details[open] summary { color: var(--accent); margin-bottom: 6px; }
+
+  /* 右侧结果区 */
+  .result { min-height: 500px; }
+  .empty {
+    background: var(--surface);
+    border: 1px dashed var(--border);
+    border-radius: 10px;
+    padding: 80px 24px;
+    text-align: center;
+    color: var(--muted);
+  }
+  .empty .icon { font-size: 48px; margin-bottom: 16px; opacity: 0.4; }
+
+  .error {
+    background: rgba(239, 65, 70, 0.1);
+    border: 1px solid var(--red);
+    border-radius: 8px;
+    padding: 14px 18px;
+    color: #ff8088;
+    font-family: "Cascadia Code", Consolas, monospace;
+    font-size: 12px;
+    white-space: pre-wrap;
+    margin-bottom: 16px;
+  }
+
+  /* 加载中 */
+  .loading {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 60px;
+    text-align: center;
+  }
+  .spinner {
+    display: inline-block;
+    width: 40px; height: 40px;
+    border: 3px solid var(--border);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 1s linear infinite;
+    margin-bottom: 16px;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .loading .hint { color: var(--muted); font-size: 13px; }
+  .loading .params-hint { color: var(--text); font-size: 14px; margin-bottom: 12px; }
+
+  /* 指标卡 */
+  .metrics {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 10px;
+    margin-bottom: 16px;
+  }
+  @media (max-width: 1100px) { .metrics { grid-template-columns: repeat(2, 1fr); } }
+  .metric {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px 16px;
+  }
+  .metric .label { color: var(--muted); font-size: 12px; margin-bottom: 6px; }
+  .metric .value { font-size: 22px; font-weight: 700; font-family: "Cascadia Code", Consolas, monospace; }
+  .metric.green .value { color: var(--green); }
+  .metric.red .value { color: var(--red); }
+  .metric.muted .value { color: var(--muted); }
+
+  /* 图表卡 */
+  .charts { display: grid; gap: 14px; }
+  .chart-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px 18px;
+  }
+  .chart-title {
+    font-size: 13px; color: var(--muted); margin-bottom: 10px;
+    text-transform: uppercase; letter-spacing: 0.5px;
+  }
+  .chart { width: 100%; height: 320px; }
+  .chart-tall { height: 380px; }
+
+  /* 提示文本 */
+  .meta { color: var(--muted); font-size: 12px; margin-top: 12px; }
+  .preset-row { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 14px; }
+  .preset {
+    font-size: 11px; padding: 4px 8px;
+    background: var(--surface-2); border: 1px solid var(--border);
+    border-radius: 12px; cursor: pointer; color: var(--muted);
+  }
+  .preset:hover { color: var(--accent); border-color: var(--accent); }
+
+  footer {
+    padding: 16px 28px;
+    color: var(--muted);
+    font-size: 11px;
+    text-align: center;
+    border-top: 1px solid var(--border);
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>📈 量化回测 · 控制台</h1>
+  <span class="badge">A 股 · 月频动量/反转 · 离线</span>
+</header>
+
+<main>
+  <!-- 左侧表单栏 -->
+  <aside class="panel">
+    <h2>参数</h2>
+
+    <div class="preset-row">
+      <span class="preset" onclick="fillPreset('消费', 'momentum', 120, 15, 'M', 'sh000932')">消费·动量120</span>
+      <span class="preset" onclick="fillPreset('消费', 'reversal', 20, 15, 'M', 'sh000932')">消费·反转20</span>
+      <span class="preset" onclick="fillPreset('hs300', 'momentum', 120, 20, 'M', 'sh000300')">沪深300·动量120</span>
+      <span class="preset" onclick="fillPreset('hs300', 'reversal', 20, 20, 'M', 'sh000300')">沪深300·反转20</span>
+    </div>
+
+    <form id="runForm" onsubmit="return onSubmit(event)">
+      <div class="field">
+        <label>股票池</label>
+        <select name="pool" id="pool">
+          <option value="消费">消费 (000932)</option>
+          <option value="可选消费">可选消费 (000989)</option>
+          <option value="医药">医药 (000933)</option>
+          <option value="白酒">白酒 (399997)</option>
+          <option value="蓝筹">蓝筹 / 沪深300 (000300)</option>
+          <option value="hs300">沪深300</option>
+          <option value="zz500">中证500</option>
+          <option value="zz1000">中证1000</option>
+          <option value="cyb">创业板</option>
+          <option value="">手动指定代码</option>
+        </select>
+      </div>
+
+      <div class="field" id="codesField" style="display:none">
+        <label>手动代码（逗号分隔，6 位）</label>
+        <input type="text" name="codes" placeholder="如: 600031,002557,000858">
+      </div>
+
+      <div class="field">
+        <label>选股因子</label>
+        <select name="strategy" id="strategy">
+          <option value="momentum">动量 (Momentum)</option>
+          <option value="reversal">反转 (Reversal)</option>
+          <option value="low_vol">低波动 (Low Volatility)</option>
+          <option value="ma_trend">均线趋势</option>
+          <option value="ma_breakout">均线突破</option>
+        </select>
+      </div>
+
+      <div class="field-row">
+        <div class="field">
+          <label>开始日期</label>
+          <input type="text" name="start" value="20200101" placeholder="20200101">
+        </div>
+        <div class="field">
+          <label>结束日期</label>
+          <input type="text" name="end" value="20240909" placeholder="20240909">
+        </div>
+      </div>
+
+      <div class="field-row">
+        <div class="field">
+          <label>Top N（持仓只数）</label>
+          <input type="number" name="top_n" value="15" min="3" max="100">
+        </div>
+        <div class="field">
+          <label>回看天数</label>
+          <input type="number" name="lookback" value="120" min="5" max="500">
+        </div>
+      </div>
+
+      <div class="field-row">
+        <div class="field">
+          <label>调仓频率</label>
+          <select name="rebalance">
+            <option value="M" selected>月度 M</option>
+            <option value="2M">双月 2M</option>
+            <option value="W">周度 W</option>
+            <option value="Q">季度 Q</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>缓冲带</label>
+          <input type="number" name="buffer" value="0" min="0" max="20">
+        </div>
+      </div>
+
+      <div class="field">
+        <label>基准指数</label>
+        <select name="benchmark">
+          <option value="sh000300" selected>沪深300 sh000300</option>
+          <option value="sh000905">中证500 sh000905</option>
+          <option value="sh000852">中证1000 sh000852</option>
+          <option value="sh000016">上证50 sh000016</option>
+          <option value="sh000932">中证消费 sh000932</option>
+          <option value="sh000933">中证医药 sh000933</option>
+          <option value="sz399997">中证白酒 sz399997</option>
+        </select>
+      </div>
+
+      <div class="field check">
+        <input type="checkbox" name="use_open" id="use_open" checked>
+        <label for="use_open" style="margin: 0">用次日开盘价成交（避免未来函数）</label>
+      </div>
+
+      <button type="submit" class="btn" id="submitBtn">▶  运行回测</button>
+    </form>
+
+    <div class="meta">
+      数据来源: akshare（新浪 + 东财）<br>
+      数据有本地缓存，二次运行秒级返回。<br>
+      <span id="health"></span>
+    </div>
+  </aside>
+
+  <!-- 右侧结果区 -->
+  <section class="result" id="result">
+    <div class="empty">
+      <div class="icon">📊</div>
+      <div>填写左侧参数，点击「运行回测」即可看到结果。</div>
+      <div style="margin-top:8px; font-size:12px;">已知的稳健组合: <span style="color:var(--accent)">消费·reversal_20</span> / <span style="color:var(--accent)">沪深300·reversal_20</span> / <span style="color:var(--accent)">HS300+消费+医药多池组合</span></div>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <span>基于 quant 包 · 数据本地缓存 · 详见 README.md</span>
+</footer>
+
+<script>
+/* ----------- 状态 ----------- */
+let charts = { equity: null, dd: null, annual: null, monthly: null };
+const $ = (id) => document.getElementById(id);
+
+/* ----------- 池子切换 ----------- */
+$('pool').addEventListener('change', () => {
+  $('codesField').style.display = $('pool').value === '' ? 'block' : 'none';
+});
+
+/* ----------- 预设按钮 ----------- */
+function fillPreset(pool, strategy, lookback, top_n, rebalance, benchmark) {
+  $('pool').value = pool;
+  $('pool').dispatchEvent(new Event('change'));
+  $('strategy').value = strategy;
+  $('lookback').value = lookback;
+  $('top_n').value = top_n;
+  $('rebalance').value = rebalance;
+  $('benchmark').value = benchmark;
+}
+
+/* ----------- 健康检查 ----------- */
+fetch('/api/health').then(r => r.json()).then(h => {
+  $('health').textContent = h.ok ? '● 服务在线' : '● 服务异常';
+}).catch(() => { $('health').textContent = '● 服务离线'; });
+
+/* ----------- 提交 ----------- */
+async function onSubmit(e) {
+  e.preventDefault();
+  const f = e.target;
+  const pool = f.pool.value.trim();
+  const codes = f.codes.value.trim();
+  if (!pool && !codes) { alert('请填写「股票池」或「手动代码」'); return false; }
+  const params = {
+    pool: pool,
+    codes: codes,
+    strategy: f.strategy.value,
+    lookback: parseInt(f.lookback.value),
+    top_n: parseInt(f.top_n.value),
+    buffer: parseInt(f.buffer.value),
+    rebalance: f.rebalance.value,
+    start: f.start.value.trim(),
+    end: f.end.value.trim(),
+    use_open: f.use_open.checked,
+    benchmark: f.benchmark.value,
+  };
+  const summary = `${params.pool || params.codes} · ${params.strategy} · lookback=${params.lookback} · top${params.top_n}`;
+  $('result').innerHTML = `
+    <div class="loading">
+      <div class="spinner"></div>
+      <div class="params-hint">回测中：${summary}</div>
+      <div class="hint">首次运行需要拉数据，请耐心等待（HS300 大池约 1-2 分钟）。</div>
+    </div>`;
+  $('submitBtn').disabled = true;
+  $('submitBtn').textContent = '⏳ 运行中...';
+
+  try {
+    const resp = await fetch('/api/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(params),
+    });
+    const data = await resp.json();
+    if (data.error) {
+      $('result').innerHTML = `<div class="error">${escapeHtml(data.error)}</div>`;
+    } else {
+      renderResult(data, summary);
+    }
+  } catch (err) {
+    $('result').innerHTML = `<div class="error">请求失败: ${escapeHtml(String(err))}</div>`;
+  } finally {
+    $('submitBtn').disabled = false;
+    $('submitBtn').textContent = '▶  运行回测';
+  }
+  return false;
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[c]));
+}
+
+/* ----------- 渲染结果 ----------- */
+function renderResult(d, summary) {
+  const m = d.metrics || {};
+  const fmtPct = v => (v == null || isNaN(v)) ? '-' : (v >= 0 ? '+' : '') + (v * 100).toFixed(1) + '%';
+  const fmtNum = v => (v == null || isNaN(v)) ? '-' : v.toFixed(2);
+  const cls = v => v == null || isNaN(v) ? 'muted' : (v >= 0 ? 'green' : 'red');
+
+  const cards = [
+    { label: m.total_return?.label || '总收益', value: fmtPct(m.total_return?.value), cls: cls(m.total_return?.value) },
+    { label: m.sharpe?.label || '夏普', value: fmtNum(m.sharpe?.value), cls: m.sharpe?.value >= 1 ? 'green' : 'muted' },
+    { label: m.max_drawdown?.label || '最大回撤', value: fmtPct(m.max_drawdown?.value), cls: cls(m.max_drawdown?.value) },
+    { label: m.excess_return?.label || '超额收益', value: fmtPct(m.excess_return?.value), cls: cls(m.excess_return?.value) },
+  ];
+  const sub = [
+    { label: m.annual_return?.label || '年化', value: fmtPct(m.annual_return?.value), cls: cls(m.annual_return?.value) },
+    { label: m.annual_volatility?.label || '年化波动', value: fmtPct(m.annual_volatility?.value), cls: 'muted' },
+    { label: m.information_ratio?.label || '信息比率', value: fmtNum(m.information_ratio?.value), cls: m.information_ratio?.value >= 0.5 ? 'green' : 'muted' },
+    { label: m.win_rate?.label || '日胜率', value: fmtPct(m.win_rate?.value), cls: cls(m.win_rate?.value) },
+  ];
+
+  let html = '<div class="metrics">';
+  [...cards, ...sub].forEach(c => {
+    html += `<div class="metric ${c.cls}"><div class="label">${escapeHtml(c.label)}</div><div class="value">${c.value}</div></div>`;
+  });
+  html += '</div>';
+
+  html += `<div class="charts">
+    <div class="chart-card"><div class="chart-title">净值曲线 · 策略 vs 基准</div><div class="chart chart-tall" id="eqChart"></div></div>
+    <div class="chart-card"><div class="chart-title">回撤曲线</div><div class="chart" id="ddChart"></div></div>
+    <div class="chart-card"><div class="chart-title">分年度收益</div><div class="chart" id="annualChart"></div></div>
+    <div class="chart-card"><div class="chart-title">月度收益热力图</div><div class="chart chart-tall" id="monthlyChart"></div></div>
+  </div>`;
+  html += `<div class="meta">回测: ${escapeHtml(summary)} · 数据条数: ${d.dates?.length || 0} · 输出前缀: ${escapeHtml(d.prefix || '-')}</div>`;
+
+  $('result').innerHTML = html;
+
+  renderEquityChart(d);
+  renderDrawdownChart(d);
+  renderAnnualChart(d);
+  renderMonthlyChart(d);
+}
+
+/* ----------- ECharts: 净值对比 ----------- */
+function renderEquityChart(d) {
+  const chart = echarts.init(document.getElementById('eqChart'));
+  const dates = d.dates || [];
+  const eq = d.equity || [];
+  const series = [{
+    name: '策略', type: 'line', showSymbol: false, smooth: true,
+    data: eq, lineStyle: { width: 2, color: '#f5a623' },
+    itemStyle: { color: '#f5a623' },
+    areaStyle: {
+      color: { type: 'linear', x: 0, y: 0, x2: 0, y2: 1,
+        colorStops: [
+          { offset: 0, color: 'rgba(245, 166, 35, 0.25)' },
+          { offset: 1, color: 'rgba(245, 166, 35, 0)' },
+        ]}
+    },
+  }];
+  if (d.benchmark) {
+    series.push({
+      name: '基准', type: 'line', showSymbol: false, smooth: true,
+      data: d.benchmark.values, lineStyle: { width: 1.5, color: '#8b9bbd', type: 'dashed' },
+      itemStyle: { color: '#8b9bbd' },
+    });
+  }
+  chart.setOption({
+    backgroundColor: 'transparent',
+    grid: { left: 60, right: 30, top: 30, bottom: 50 },
+    tooltip: { trigger: 'axis',
+      backgroundColor: 'rgba(24, 35, 58, 0.95)', borderColor: '#2c3d5e', textStyle: { color: '#e6ecf5' },
+      valueFormatter: v => v.toFixed(3) },
+    legend: { textStyle: { color: '#8b9bbd' }, top: 0 },
+    xAxis: {
+      type: 'category', data: dates,
+      axisLine: { lineStyle: { color: '#2c3d5e' } },
+      axisLabel: { color: '#8b9bbd', fontSize: 10 },
+      splitLine: { show: false },
+    },
+    yAxis: {
+      type: 'value', scale: true,
+      axisLine: { lineStyle: { color: '#2c3d5e' } },
+      axisLabel: { color: '#8b9bbd' },
+      splitLine: { lineStyle: { color: 'rgba(44, 61, 94, 0.4)', type: 'dashed' } },
+    },
+    series,
+  });
+  charts.equity = chart;
+}
+
+/* ----------- ECharts: 回撤 ----------- */
+function renderDrawdownChart(d) {
+  const chart = echarts.init(document.getElementById('ddChart'));
+  const dates = d.dates || [];
+  const dd = (d.drawdown || []).map(v => +(v * 100).toFixed(2));
+  chart.setOption({
+    backgroundColor: 'transparent',
+    grid: { left: 60, right: 30, top: 20, bottom: 50 },
+    tooltip: { trigger: 'axis',
+      backgroundColor: 'rgba(24, 35, 58, 0.95)', borderColor: '#2c3d5e', textStyle: { color: '#e6ecf5' },
+      valueFormatter: v => v.toFixed(2) + '%' },
+    xAxis: { type: 'category', data: dates,
+      axisLine: { lineStyle: { color: '#2c3d5e' } },
+      axisLabel: { color: '#8b9bbd', fontSize: 10 } },
+    yAxis: { type: 'value',
+      axisLabel: { color: '#8b9bbd', formatter: '{value}%' },
+      splitLine: { lineStyle: { color: 'rgba(44, 61, 94, 0.4)', type: 'dashed' } } },
+    series: [{
+      name: '回撤', type: 'line', data: dd, showSymbol: false,
+      lineStyle: { color: '#ef4146', width: 1.5 },
+      itemStyle: { color: '#ef4146' },
+      areaStyle: { color: 'rgba(239, 65, 70, 0.2)' },
+    }],
+  });
+  charts.dd = chart;
+}
+
+/* ----------- ECharts: 年度柱状图 ----------- */
+function renderAnnualChart(d) {
+  const chart = echarts.init(document.getElementById('annualChart'));
+  const a = d.annual || [];
+  const years = a.map(r => r.year);
+  const rets = a.map(r => +(r.return * 100).toFixed(1));
+  const sharpes = a.map(r => r.sharpe);
+  chart.setOption({
+    backgroundColor: 'transparent',
+    grid: { left: 60, right: 60, top: 30, bottom: 50 },
+    tooltip: { trigger: 'axis',
+      backgroundColor: 'rgba(24, 35, 58, 0.95)', borderColor: '#2c3d5e', textStyle: { color: '#e6ecf5' } },
+    legend: { textStyle: { color: '#8b9bbd' }, top: 0 },
+    xAxis: { type: 'category', data: years,
+      axisLine: { lineStyle: { color: '#2c3d5e' } },
+      axisLabel: { color: '#8b9bbd' } },
+    yAxis: [
+      { type: 'value', name: '收益%', position: 'left',
+        axisLabel: { color: '#8b9bbd', formatter: '{value}%' },
+        splitLine: { lineStyle: { color: 'rgba(44, 61, 94, 0.4)', type: 'dashed' } },
+        nameTextStyle: { color: '#8b9bbd' } },
+      { type: 'value', name: '夏普', position: 'right',
+        axisLabel: { color: '#8b9bbd' },
+        splitLine: { show: false },
+        nameTextStyle: { color: '#8b9bbd' } },
+    ],
+    series: [
+      { name: '年度收益', type: 'bar', data: rets,
+        itemStyle: {
+          color: (p) => p.data >= 0 ? '#16c060' : '#ef4146',
+          borderRadius: [4, 4, 0, 0],
+        },
+        label: { show: true, position: 'top', color: '#e6ecf5', fontSize: 11,
+          formatter: p => p.data >= 0 ? '+' + p.data + '%' : p.data + '%' },
+      },
+      { name: '夏普', type: 'line', yAxisIndex: 1, data: sharpes,
+        lineStyle: { color: '#4a9cf6', width: 2 },
+        itemStyle: { color: '#4a9cf6' }, symbolSize: 8 },
+    ],
+  });
+  charts.annual = chart;
+}
+
+/* ----------- ECharts: 月度热力图 ----------- */
+function renderMonthlyChart(d) {
+  const chart = echarts.init(document.getElementById('monthlyChart'));
+  const { years = [], months = [], values = [] } = d.monthly || {};
+  const monthNames = ['1月','2月','3月','4月','5月','6月','7月','8月','9月','10月','11月','12月'];
+  const xLabels = months.map(m => monthNames[m - 1] || m);
+  const data = [];
+  values.forEach((row, yi) => {
+    row.forEach((v, mi) => {
+      data.push([mi, yi, +(v * 100).toFixed(2)]);
+    });
+  });
+  const maxAbs = Math.max(1, ...data.map(d => Math.abs(d[2])));
+  chart.setOption({
+    backgroundColor: 'transparent',
+    grid: { left: 80, right: 30, top: 30, bottom: 30 },
+    tooltip: {
+      backgroundColor: 'rgba(24, 35, 58, 0.95)', borderColor: '#2c3d5e', textStyle: { color: '#e6ecf5' },
+      formatter: p => `${years[p.value[1]]} ${monthNames[p.value[0]]}<br/>收益: ${p.value[2] >= 0 ? '+' : ''}${p.value[2].toFixed(2)}%`,
+    },
+    xAxis: { type: 'category', data: xLabels,
+      axisLine: { lineStyle: { color: '#2c3d5e' } },
+      axisLabel: { color: '#8b9bbd' },
+      splitArea: { show: true, areaStyle: { color: ['rgba(24, 35, 58, 0.3)', 'rgba(32, 48, 77, 0.3)'] } } },
+    yAxis: { type: 'category', data: years,
+      axisLine: { lineStyle: { color: '#2c3d5e' } },
+      axisLabel: { color: '#8b9bbd' },
+      splitArea: { show: true, areaStyle: { color: ['rgba(24, 35, 58, 0.3)', 'rgba(32, 48, 77, 0.3)'] } } },
+    visualMap: {
+      min: -maxAbs, max: maxAbs,
+      calculable: true, orient: 'horizontal', left: 'center', bottom: 0,
+      inRange: { color: ['#ef4146', '#1c2a47', '#16c060'] },
+      textStyle: { color: '#8b9bbd' },
+      formatter: v => v.toFixed(0) + '%',
+    },
+    series: [{
+      name: '月收益', type: 'heatmap', data,
+      label: { show: true, color: '#e6ecf5', fontSize: 10,
+        formatter: p => Math.abs(p.value[2]) < 0.1 ? '' : (p.value[2] >= 0 ? '+' : '') + p.value[2].toFixed(1) },
+      emphasis: { itemStyle: { shadowBlur: 8, shadowColor: 'rgba(0,0,0,0.5)' } },
+    }],
+  });
+  charts.monthly = chart;
+}
+
+/* ----------- 响应窗口大小 ----------- */
+window.addEventListener('resize', () => {
+  Object.values(charts).forEach(c => c && c.resize());
+});
+</script>
+
+</body>
+</html>

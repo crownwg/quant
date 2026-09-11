@@ -1,0 +1,9 @@
+pandas>=2.0
+numpy>=1.24
+akshare>=1.15
+
+# Web 控制台（quant/web.py + templates/index.html）
+fastapi>=0.110
+uvicorn>=0.27
+jinja2>=3.1
+python-multipart>=0.0.9
