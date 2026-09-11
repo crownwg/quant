@@ -6,6 +6,10 @@
 """
 from __future__ import annotations
 
+import asyncio
+import pathlib
+import re
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -303,3 +307,206 @@ def test_compute_monthly_shape():
     assert {1, 2, 3} <= set(out["months"])
     assert len(out["values"]) == 1
     assert len(out["values"][0]) == len(out["months"])
+
+
+# --------------------------------------------------- 数据体检 / 数据更新
+
+def test_pool_and_codes_are_additive():
+    """--pool 与 --codes 必须能同时传。
+
+    main.py 的语义是两者取并集，页面早期写成二选一，导致
+    「消费池 + 002557 洽洽食品」这种用法完全做不到——而洽洽食品
+    不在任何指数的成分股里，只能靠 --codes 补进来。
+    """
+    cmd = web._build_cmd(_p(pool="消费", codes="002557"), "px_")
+    assert _get(cmd, "--pool") == "消费"
+    assert _get(cmd, "--codes") == "002557"
+
+
+def test_codes_only_still_works():
+    cmd = web._build_cmd(_p(pool="", codes="600031"), "px_")
+    assert "--pool" not in cmd
+    assert _get(cmd, "--codes") == "600031"
+
+
+def test_refresh_cmd_has_flag_and_nothing_else():
+    """数据更新命令只该带 --refresh-data，不该掺择时 / 样本外的参数。
+
+    掺进去不会报错，但会让人以为「更新数据」也顺带跑了回测，
+    或者反之以为回测已经跑过。
+    """
+    cmd = web._build_cmd(_p(pool="消费"), "px_", refresh_only=True)
+    assert "--refresh-data" in cmd
+    assert "--walk-forward" not in cmd
+    assert "--timing" not in cmd
+    assert "--vol-target" not in cmd
+    assert "--holdings" not in cmd
+
+
+def test_normal_run_never_has_refresh_flag():
+    assert "--refresh-data" not in web._build_cmd(_p(), "px_")
+    assert "--refresh-data" not in web._build_cmd(
+        _p(walk_forward=True), "px_")
+    assert "--refresh-data" not in web._build_cmd(
+        _p(), "px_", plan_only=True, holdings_path="h.csv")
+
+
+def test_freshness_flags_historical_replay(monkeypatch):
+    """结束日远早于数据最新日 —— 最危险的情况（默认 20240909 就在这里）。"""
+    monkeypatch.setattr(web, "_resolve_codes", lambda p: (["600519"], None))
+    monkeypatch.setattr(web, "cache_freshness",
+                        lambda cs: [{"code": "600519", "last": "2026-09-10", "rows": 1}])
+    d = asyncio.run(web.data_freshness(_p(end="20240909")))
+    assert d["latest"] == "2026-09-10"
+    assert d["ahead_of_data"] is True
+    assert d["usable"] is False
+    assert "历史回放" in d["message"]
+
+
+def test_freshness_ok_when_end_matches_latest(monkeypatch):
+    monkeypatch.setattr(web, "_resolve_codes", lambda p: (["600519"], None))
+    monkeypatch.setattr(web, "cache_freshness",
+                        lambda cs: [{"code": "600519", "last": "2026-09-10", "rows": 1}])
+    d = asyncio.run(web.data_freshness(_p(end="20260910")))
+    assert d["usable"] is True
+    assert d["ahead_of_data"] is False and d["behind_end"] is False
+
+
+def test_freshness_flags_end_beyond_data(monkeypatch):
+    monkeypatch.setattr(web, "_resolve_codes", lambda p: (["600519"], None))
+    monkeypatch.setattr(web, "cache_freshness",
+                        lambda cs: [{"code": "600519", "last": "2026-09-10", "rows": 1}])
+    d = asyncio.run(web.data_freshness(_p(end="20261231")))
+    assert d["behind_end"] is True and d["usable"] is False
+    assert "更新数据" in d["message"]
+
+
+def test_freshness_tolerates_weekend_gap(monkeypatch):
+    """差 1~5 天是周末 / 长假 / 停牌的常态，不该天天报警。"""
+    monkeypatch.setattr(web, "_resolve_codes", lambda p: (["600519"], None))
+    monkeypatch.setattr(web, "cache_freshness",
+                        lambda cs: [{"code": "600519", "last": "2026-09-09", "rows": 1}])
+    d = asyncio.run(web.data_freshness(_p(end="20260910")))
+    assert d["usable"] is True
+
+
+def test_freshness_empty_cache_has_same_keys(monkeypatch):
+    """早退分支也要给齐字段：前端只有一套渲染逻辑，缺键会渲染成 undefined。"""
+    monkeypatch.setattr(web, "_resolve_codes", lambda p: (["999999"], None))
+    monkeypatch.setattr(web, "cache_freshness",
+                        lambda cs: [{"code": "999999", "last": "", "rows": 0}])
+    d = asyncio.run(web.data_freshness(_p(end="20260910")))
+    normal = {"ok", "n_codes", "with_data", "latest", "end", "usable",
+              "behind_end", "ahead_of_data", "stale", "n_stale",
+              "empty", "n_empty", "message"}
+    assert normal <= set(d)
+    assert d["with_data"] == 0 and d["usable"] is False
+    assert d["n_empty"] == 1
+
+
+def test_freshness_reports_stale_and_empty(monkeypatch):
+    monkeypatch.setattr(web, "_resolve_codes", lambda p: (["600519", "002557", "999999"], None))
+    monkeypatch.setattr(web, "cache_freshness", lambda cs: [
+        {"code": "600519", "last": "2026-09-10", "rows": 1},
+        {"code": "002557", "last": "2024-09-09", "rows": 1},   # 停更两年
+        {"code": "999999", "last": "", "rows": 0},             # 完全没数据
+    ])
+    d = asyncio.run(web.data_freshness(_p(end="20260910")))
+    assert [r["code"] for r in d["stale"]] == ["002557"]
+    assert d["empty"] == ["999999"]
+    assert d["n_stale"] == 1 and d["n_empty"] == 1
+    assert "明显落后" in d["message"] and "没有缓存" in d["message"]
+
+
+def test_freshness_pool_error_is_not_exception(monkeypatch):
+    """池名写错要给可读提示，而不是 500。"""
+    monkeypatch.setattr(web, "_resolve_codes", lambda p: ([], "股票池解析失败: 未知股票池"))
+    d = asyncio.run(web.data_freshness(_p(pool="乱写")))
+    assert d["ok"] is False and "未知股票池" in d["error"]
+
+
+# --------------------------------------------------- _resolve_codes 并集语义
+
+def test_resolve_codes_merges_pool_and_codes(monkeypatch):
+    from quant import universe
+    monkeypatch.setattr(universe, "build_universe_report",
+                        lambda spec, **kw: (["600519", "000858"], []))
+    codes, err = web._resolve_codes(_p(pool="消费", codes="002557, 858"))
+    assert err is None
+    # 池内两只 + 新加一只；858 与已有的 000858 去重，不重复出现
+    assert codes == ["600519", "000858", "002557"]
+
+
+def test_resolve_codes_empty_is_error():
+    codes, err = web._resolve_codes(_p(pool="", codes=""))
+    assert codes == [] and err
+
+
+# --------------------------------------------------- 前端 DOM 契约（静态检查）
+
+# 这几项检查的是「HTML 与 JS 对不上」这类错误。它们在浏览器里不报错，
+# 只是表现为「点了没反应」或「结果不对」，是前端最难查的一类问题。
+# 真实案例：预设按钮里的 $('lookback') 对应的 input 只有 name 没有 id，
+# 取到 null 后赋值抛 TypeError，整个 fillPreset 在第 4 行就中断 ——
+# 池子切了、因子变了，看起来「有反应」，所以一直没被发现。
+
+def _index_html() -> str:
+    return (web.TEMPLATE).read_text(encoding="utf-8")
+
+
+def _inline_js(html: str) -> str:
+    blocks = re.findall(r"<script(?![^>]*\bsrc=)[^>]*>(.*?)</script>", html, re.S)
+    assert blocks, "index.html 里找不到内联脚本"
+    return max(blocks, key=len)
+
+
+def test_js_references_existing_element_ids():
+    html = _index_html()
+    js = _inline_js(html)
+    used = set(re.findall(r"\$\('([A-Za-z0-9_\-]+)'\)", js))
+    defined = set(re.findall(r'\bid="([A-Za-z0-9_\-]+)"', html))
+    assert used - defined == set(), f"JS 引用了不存在的 id: {sorted(used - defined)}"
+
+
+def test_js_reads_existing_form_fields():
+    html = _index_html()
+    js = _inline_js(html)
+    form = re.search(r'<form id="runForm".*?</form>', html, re.S)
+    assert form, "找不到 runForm"
+    names = set(re.findall(r'\bname="([A-Za-z0-9_]+)"', form.group(0)))
+    used = set(re.findall(r"\bf\.([A-Za-z_][A-Za-z0-9_]*)\.", js))
+    used |= set(re.findall(r"num\('([A-Za-z0-9_]+)'", js))
+    used |= set(re.findall(r"_setField\(\s*\w+\s*,\s*'([A-Za-z0-9_]+)'", js))
+    used.discard("")
+    assert used - names == set(), f"JS 读了表单里没有的字段: {sorted(used - names)}"
+
+
+def test_onclick_handlers_exist():
+    html = _index_html()
+    js = _inline_js(html)
+    called = set(re.findall(r'onclick="([A-Za-z_][A-Za-z0-9_]*)\(', html))
+    called |= set(re.findall(r'onsubmit="return ([A-Za-z_][A-Za-z0-9_]*)\(', html))
+    funcs = set(re.findall(r"function\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(", js))
+    assert called - funcs == set(), f"onclick 指向未定义的函数: {sorted(called - funcs)}"
+
+
+def test_frontend_only_calls_registered_api():
+    """前端 fetch 的 /api/xxx 必须在 web.py 里有对应路由。
+
+    路径打错时页面表现为「请求失败」，看不出是 404 还是服务挂了。
+    """
+    html = _index_html()
+    js = _inline_js(html)
+    called = set(re.findall(r"fetch\('(/api/[^'`]*)'", js))
+    src = (pathlib.Path(web.__file__)).read_text(encoding="utf-8")
+    routes = set(re.findall(r'@app\.(?:get|post)\("(/api/[^"]*)"', src))
+    assert called - routes == set(), f"前端调了未注册的接口: {sorted(called - routes)}"
+
+
+def test_freshness_ui_elements_present():
+    """数据体检那几个元素必须在：按钮、文案位、结果区横幅样式。"""
+    html = _index_html()
+    for el in ('id="freshbar"', 'id="freshIcon"', 'id="freshText"',
+               'id="latestBtn"', 'id="refreshBtn"'):
+        assert el in html, f"缺少 {el}"
+    assert "freshnessBanner" in _inline_js(html)

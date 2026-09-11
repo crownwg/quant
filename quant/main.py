@@ -40,7 +40,7 @@ import pandas as pd
 
 from . import factors, filters
 from .backtest import run
-from .data import load_panel, load_index
+from .data import load_panel, load_index, cache_freshness
 from .rebalance import build_plan, summarize
 from .report import build_report
 from .strategy import factor_weights, weights_from_args
@@ -585,7 +585,62 @@ def make_parser() -> argparse.ArgumentParser:
                    help="只看这一天的调仓清单（YYYYMMDD），输出精简版 today_plan.csv；省略则输出完整周期")
     p.add_argument("--holdings", default="",
                    help="当前持仓 CSV（含 code,shares 两列），用于计算「目标 vs 实际」的 delta 清单")
+
+    # 数据维护
+    p.add_argument("--refresh-data", action="store_true",
+                   help="只把池内数据增量补齐到 --end，不跑回测；用于让「今日清单」有最新价格")
     return p
+
+
+def _run_refresh_data(codes: list[str], fetch_start: str, end: str,
+                      data_dir: str = "data") -> None:
+    """只做数据增量更新，不跑回测。
+
+    为什么要单独一个模式：个股缓存的新鲜度是参差不齐的——抽样 30 只里
+    有 15 只停在几个月前。直接跑回测只会更新「本次真正用到的那几只」，
+    池里其余标的仍旧是旧数据，下一次调仓清单里就可能混进过期价格
+    （算出来的股数是对的，但价格不是今天的）。这里把整池一次性补齐。
+    """
+    before = {r["code"]: r["last"] for r in cache_freshness(codes, data_dir)}
+    missing = [c for c in codes if not before.get(c)]
+    print(f"\n▶ 增量更新 {len(codes)} 只标的的数据 → 目标 {end}"
+          f"（本地无缓存 {len(missing)} 只，将从 {fetch_start} 起拉全量）", flush=True)
+
+    load_panel(codes, fetch_start, end,
+               sleep=0.3 if len(codes) > 20 else 1.0,
+               data_dir=data_dir, on_error="skip")
+
+    after = cache_freshness(codes, data_dir)
+    end_ts = pd.Timestamp(end)
+    latest = max((r["last"] for r in after if r["last"]), default="")
+
+    if not latest:
+        print("❌ 更新后仍没有任何可用数据，请检查网络/代理后重试")
+        return
+
+    latest_ts = pd.Timestamp(latest)
+    stale = [r for r in after if r["last"] and pd.Timestamp(r["last"]) < latest_ts]
+    empty = [r for r in after if not r["last"]]
+    # 「落后 5 个自然日以上」才算真旧。差 1~2 天多半是停牌或回调到不同收盘日，
+    # 每天都有几十只这种票，全列出来只会淹没真正的问题。
+    really_stale = [r for r in stale if (latest_ts - pd.Timestamp(r["last"])).days > 5]
+
+    print(f"\n  数据体检（共 {len(after)} 只）")
+    print(f"    最新截止日 : {latest}" + ("  ← 落后于你填的结束日 "
+          f"{end_ts.date()}" if latest_ts < end_ts else "  ✓ 已到目标"))
+    print(f"    取不到数据 : {len(empty)} 只" + (f"  {'、'.join(r['code'] for r in empty[:15])}"
+          if empty else ""))
+    print(f"    明显落后   : {len(really_stale)} 只"
+          + (f"（领先日 {latest}）" if really_stale else "  ✓"))
+
+    if really_stale:
+        for r in really_stale[:20]:
+            gap = (latest_ts - pd.Timestamp(r["last"])).days
+            print(f"      {r['code']}  末行 {r['last']}  落后 {gap} 天")
+        if len(really_stale) > 20:
+            print(f"      ...另有 {len(really_stale) - 20} 只")
+        print("    提示：多为长期停牌（拉不到新 K 线属正常）；"
+              "若整池大面积落后，多半是网络/代理问题，重跑一次即可。")
 
 
 def main() -> None:
@@ -638,6 +693,12 @@ def main() -> None:
     if args.min_listed_days > 0:
         warm_days = max(warm_days, args.min_listed_days + 30)
     fetch_start = (pd.Timestamp(args.start) - pd.Timedelta(days=warm_days)).strftime("%Y%m%d")
+
+    # ---- 数据维护模式：只更新缓存，不做回测 ----
+    # 放在这里是因为它刚好需要 codes + fetch_start，且要在 load_panel 之前分叉。
+    if getattr(args, "refresh_data", False):
+        _run_refresh_data(codes, fetch_start, args.end)
+        return
 
     # 大池首次下载较慢：池子大时降低单只间隔并允许跳过失败标的
     sleep = 0.3 if len(codes) > 20 else 1.0

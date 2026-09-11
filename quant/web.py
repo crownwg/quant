@@ -19,6 +19,8 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel, Field
 
+from quant.data import cache_freshness
+
 # 项目根目录: .../量化/
 ROOT = Path(__file__).resolve().parent.parent
 PYTHON = ROOT / ".venv" / "Scripts" / "python.exe"
@@ -140,7 +142,8 @@ def _materialize_holdings(text: str, prefix: str) -> tuple[str | None, str]:
 
 
 def _build_cmd(p: RunParams, prefix: str, plan_only: bool = False,
-               holdings_path: str | None = None) -> list[str]:
+               holdings_path: str | None = None,
+               refresh_only: bool = False) -> list[str]:
     """把表单参数翻译成 quant.main 的命令行。
 
     独立成函数是为了可被单测覆盖——参数名拼错在页面上只表现为「结果不对」，
@@ -148,6 +151,7 @@ def _build_cmd(p: RunParams, prefix: str, plan_only: bool = False,
 
     plan_only=True 时只生成调仓清单：main.py 的 holdings 分支是独立 return 的
     （不会产出净值曲线），所以清单与完整回测不能在同一次调用里兼得。
+    refresh_only=True 时只更新数据缓存，同样不产出任何回测结果。
     """
     cmd = [
         str(PYTHON), "-m", "quant.main",
@@ -163,10 +167,17 @@ def _build_cmd(p: RunParams, prefix: str, plan_only: bool = False,
     ]
     if p.use_open:
         cmd.append("--use-open")
+    # --pool 与 --codes 可以同时传：main.py 会把两者合并去重（manual + pool_codes）。
+    # 页面早期写成「二选一」，导致想「在消费池基础上补一只 002557 洽洽食品」
+    # 时只能二选一——而洽洽食品并不在任何主流指数成分股里，就没法加进来了。
     if p.pool.strip():
         cmd += ["--pool", p.pool.strip()]
-    else:
+    if p.codes.strip():
         cmd += ["--codes", p.codes.strip()]
+
+    # --- 数据维护：只更新缓存，早退，不跑回测 ---
+    if refresh_only:
+        return cmd + ["--refresh-data"]
 
     # --- 仓位管理：趋势择时 ---
     timing_mode = (p.timing or "off").strip().lower()
@@ -241,6 +252,151 @@ async def run_backtest(p: RunParams) -> dict:
         return _parse_results(prefix, cmd)
     except Exception as exc:  # noqa: BLE001
         return {"error": f"结果解析失败: {exc}"}
+
+
+def _resolve_codes(p: RunParams) -> tuple[list[str], str | None]:
+    """把页面上的「股票池 / 手动代码」解析成 6 位代码列表。
+
+    直接复用 quant.universe，不另写一套解析——两边口径一旦不同，
+    页面会告诉你「池里有 37 只」而回测其实用了别的池子，很难查。
+
+    两者的关系是**并集**而不是二选一，与 main.py 一致：这样才能
+    「在消费池上补一只 002557」——它在所有指数成分股里都没有，
+    只能靠手动代码加进来。
+    返回 (codes, error)；error 非空表示解析失败。
+    """
+    from quant import universe
+
+    codes: list[str] = []
+    if p.pool.strip():
+        try:
+            codes, _ = universe.build_universe_report(p.pool.strip())
+        except Exception as exc:  # noqa: BLE001  网络/池名错都归到这里
+            return [], f"股票池解析失败: {exc}"
+
+    raw = [c.strip() for c in re.split(r"[,\s;，、]+", p.codes) if c.strip()]
+    seen = set(codes)
+    for c in raw:
+        if c.isdigit():
+            c6 = c.zfill(6)
+            if c6 not in seen:
+                seen.add(c6)
+                codes.append(c6)
+
+    if not codes:
+        return [], "请填写「股票池」或「手动代码」"
+    return codes, None
+
+
+@app.post("/api/data_freshness")
+async def data_freshness(p: RunParams) -> dict:
+    """数据体检：池里每只标的的本地缓存更新到哪天。
+
+    只读本地 CSV，不联网，所以可以随页面加载自动调。
+    存在的意义：默认结束日是 2024-09-09，用户很可能拿到的是一份
+    **历史回放清单**却不自知——这个接口让页面能把这件事明确指出来。
+    """
+    codes, err = _resolve_codes(p)
+    if err:
+        return {"ok": False, "error": err}
+
+    rows = cache_freshness(codes)
+    dated = [r for r in rows if r["last"]]
+    if not dated:
+        # 字段与下面正常分支保持一致：前端只写一套渲染逻辑，
+        # 少一个键就会渲染成 undefined，而不是报错。
+        return {"ok": True, "n_codes": len(codes), "with_data": 0, "latest": "",
+                "end": p.end, "usable": False, "behind_end": False,
+                "ahead_of_data": False, "stale": [], "n_stale": 0,
+                "empty": codes[:50], "n_empty": len(codes),
+                "message": "池内没有任何本地缓存数据，请先点「更新数据」（约 1 分钟）。"}
+
+    latest = max(r["last"] for r in dated)
+    latest_ts = pd.Timestamp(latest)
+    end_ts = pd.Timestamp(p.end)
+    stale = [r for r in dated
+             if (latest_ts - pd.Timestamp(r["last"])).days > 5]
+    empty = [r["code"] for r in rows if not r["last"]]
+
+    # 两个方向都要看，方向不同、后果不同：
+    #   end 远晚于数据  → 数据没更新够，最后一截是空的；
+    #   end 远早于数据  → （默认 20240909 就落在这里）拿到的是一份
+    #                     「如果在 2024-09-09 调仓该买什么」的历史回放清单，
+    #                     看着像今天的操作建议，其实不是。这个更危险。
+    gap_end_too_new = (end_ts - latest_ts).days
+    gap_end_too_old = (latest_ts - end_ts).days
+    # 留 5 天容差：周末 / 长假 / 停牌都会让「最新交易日」天然早于日历日，
+    # 差 1~5 天属正常，不该天天报警。
+    too_new = gap_end_too_new > 5
+    too_old = gap_end_too_old > 5
+
+    msgs: list[str] = []
+    if too_old:
+        msgs.append(f"⚠️ 结束日 {end_ts.date()} 比数据最新日 {latest} 早了 "
+                    f"{gap_end_too_old} 天：这份清单是**历史回放**"
+                    f"（回答的是「那天该买什么」），不是「今天该买什么」。"
+                    f"要拿能用的清单，把结束日改成 {latest}。")
+    elif too_new:
+        msgs.append(f"⚠️ 数据只到 {latest}，比结束日 {end_ts.date()} 早 "
+                    f"{gap_end_too_new} 天：末尾这段没有数据，"
+                    f"请先点「更新数据」。")
+    else:
+        msgs.append(f"✓ 数据已更新到 {latest}，与结束日 {end_ts.date()} 一致。")
+
+    if stale:
+        msgs.append(f"（池内 {len(stale)} 只明显落后，多为长期停牌或新上市，属正常。）")
+    if empty:
+        msgs.append(f"（有 {len(empty)} 只完全没有缓存数据，选股会跳过它们。）")
+
+    return {
+        "ok": True,
+        "n_codes": len(codes),
+        "with_data": len(dated),
+        "latest": latest,
+        "end": str(end_ts.date()),
+        "behind_end": bool(too_new),
+        "ahead_of_data": bool(too_old),
+        "usable": bool(not too_old and not too_new),
+        "stale": stale[:30],
+        "n_stale": len(stale),
+        "empty": empty[:50],
+        "n_empty": len(empty),
+        "message": " ".join(msgs),
+    }
+
+
+@app.post("/api/refresh_data")
+async def refresh_data(p: RunParams) -> dict:
+    """把池内数据增量补齐到 --end（联网拉取，耗时随池子大小增长）。
+
+    单独一个按钮而不是回测的副作用：不这样的话，用户只会更新到
+    「本次选中的那几只」，池里其余标的永远是旧的。
+    """
+    if not PYTHON.exists():
+        raise HTTPException(500, f"找不到 venv 解释器: {PYTHON}")
+    if not p.pool.strip() and not p.codes.strip():
+        raise HTTPException(400, "必须填写「股票池」或「手动代码」其中之一")
+
+    prefix = f"web_{uuid.uuid4().hex[:8]}_"
+    cmd = _build_cmd(p, prefix, refresh_only=True)
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=3600, cwd=str(ROOT),
+            encoding="utf-8", errors="replace",
+        )
+    except subprocess.TimeoutExpired:
+        return {"error": "更新数据超时（>60 分钟）。池子太大时请改用命令行分批更新。"}
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"启动失败: {exc}"}
+
+    if proc.returncode != 0:
+        tail = (proc.stderr or proc.stdout or "").strip()[-1500:]
+        return {"error": f"退出码 {proc.returncode}\n{tail}"}
+
+    res = await data_freshness(p)
+    res["stdout_tail"] = (proc.stdout or "")[-3000:]
+    res["cmd"] = cmd
+    return res
 
 
 @app.post("/api/plan")

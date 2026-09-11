@@ -36,6 +36,35 @@ def _save_coverage(data_dir: str, coverage: dict[str, pd.Timestamp]) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
 
 
+def cache_freshness(codes, data_dir: str = "data") -> list[dict]:
+    """读每只标的的本地缓存，报告最后一根 K 线的日期。
+
+    只看缓存文件、不联网 —— 所以 Web 页面可以随加载自动调，
+    既不拖慢也不可能因为网络失败而报错。
+
+    存在的意义：个股缓存的更新进度是参差不齐的（抽样 30 只里有 15 只
+    停在几个月前）。不体检的话，用户会以为「回测跑通了」就等于
+    「数据是新的」，拿着过期价格去下单。
+    """
+    rows: list[dict] = []
+    for c in codes:
+        path = Path(data_dir) / f"{str(c).zfill(6)}.csv"
+        if not path.exists():
+            rows.append({"code": str(c).zfill(6), "last": "", "rows": 0})
+            continue
+        try:
+            s = pd.read_csv(path, usecols=["date"])["date"]
+            last = pd.to_datetime(s).max()
+            rows.append({
+                "code": str(c).zfill(6),
+                "last": last.strftime("%Y-%m-%d") if pd.notna(last) else "",
+                "rows": int(len(s)),
+            })
+        except Exception:  # noqa: BLE001  单个缓存损坏不该让整份体检失败
+            rows.append({"code": str(c).zfill(6), "last": "", "rows": 0})
+    return rows
+
+
 def _sina_symbol(code: str) -> str:
     """6 位代码 -> 新浪接口需要的带交易所前缀 symbol。"""
     code = str(code).zfill(6)  # 补齐前导零：858 -> 000858

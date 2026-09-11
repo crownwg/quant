@@ -119,6 +119,40 @@
     margin-bottom: 10px;
   }
   .btn-alt:hover:not(:disabled) { border-color: var(--accent); box-shadow: none; }
+  /* 小号按钮：数据体检条里两个并排的操作用，不占满宽度 */
+  .btn-mini {
+    width: auto; flex: 1; margin-bottom: 0;
+    padding: 6px 10px; font-size: 12px; border-radius: 6px;
+    transform: none !important;
+  }
+
+  /* 数据体检条 */
+  .freshbar {
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 12px;
+    margin-bottom: 14px;
+    font-size: 12px; line-height: 1.65; color: var(--muted);
+  }
+  .freshbar.warn { border-color: var(--accent); }
+  .freshbar.ok { border-color: rgba(22, 192, 96, 0.45); }
+  .freshbar-line { display: flex; gap: 6px; align-items: flex-start; }
+  .fresh-icon { flex: 0 0 auto; }
+  .freshbar b { color: var(--text); font-weight: 600; }
+  .freshbar-actions { display: flex; gap: 6px; margin-top: 9px; }
+  .freshbar.warn .fresh-icon, .freshbar.warn #freshText { color: var(--accent); }
+
+  /* 结果区顶部的数据时效告警 */
+  .databanner {
+    border: 1px solid var(--accent);
+    background: rgba(245, 166, 35, 0.08);
+    border-radius: 8px;
+    padding: 12px 14px;
+    margin-bottom: 14px;
+    font-size: 13px; line-height: 1.7; color: var(--text);
+  }
+  .databanner b { color: var(--accent); }
 
   details { margin-bottom: 14px; }
   details summary {
@@ -300,9 +334,9 @@
         </select>
       </div>
 
-      <div class="field" id="codesField" style="display:none">
-        <label>手动代码（逗号分隔，6 位）</label>
-        <input type="text" name="codes" placeholder="如: 600031,002557,000858">
+      <div class="field" id="codesField">
+        <label>额外补充代码（可选，与股票池取并集）</label>
+        <input type="text" name="codes" id="codes" placeholder="如: 002557（洽洽食品不在任何指数成分股里，只能这样加）">
       </div>
 
       <div class="field">
@@ -327,21 +361,36 @@
         </div>
       </div>
 
+      <!-- 数据体检：结束日期默认是过去的日子，用户很可能拿到一份「历史回放清单」
+           却不自知（回测照样跑通、数字照样好看）。这条提示把这件事摆到明面上。 -->
+      <div class="freshbar" id="freshbar">
+        <div class="freshbar-line">
+          <span class="fresh-icon" id="freshIcon">·</span>
+          <span id="freshText">正在检查数据…</span>
+        </div>
+        <div class="freshbar-actions">
+          <button type="button" class="btn btn-alt btn-mini" id="latestBtn"
+                  onclick="useLatestData()" disabled>用最新数据</button>
+          <button type="button" class="btn btn-alt btn-mini" id="refreshBtn"
+                  onclick="onRefreshData()" title="联网把股票池里每只标的的数据补齐到结束日期">更新数据</button>
+        </div>
+      </div>
+
       <div class="field-row">
         <div class="field">
           <label>Top N（持仓只数）</label>
-          <input type="number" name="top_n" value="15" min="3" max="100">
+          <input type="number" name="top_n" id="top_n" value="15" min="3" max="100">
         </div>
         <div class="field">
           <label>回看天数</label>
-          <input type="number" name="lookback" value="120" min="5" max="500">
+          <input type="number" name="lookback" id="lookback" value="120" min="5" max="500">
         </div>
       </div>
 
       <div class="field-row">
         <div class="field">
           <label>调仓频率</label>
-          <select name="rebalance">
+          <select name="rebalance" id="rebalance">
             <option value="M" selected>月度 M</option>
             <option value="2M">双月 2M</option>
             <option value="W">周度 W</option>
@@ -356,7 +405,7 @@
 
       <div class="field">
         <label>基准指数</label>
-        <select name="benchmark">
+        <select name="benchmark" id="benchmark">
           <option value="sh000300" selected>沪深300 sh000300</option>
           <option value="sh000905">中证500 sh000905</option>
           <option value="sh000852">中证1000 sh000852</option>
@@ -507,25 +556,40 @@ let charts = { equity: null, dd: null, annual: null, monthly: null };
 const $ = (id) => document.getElementById(id);
 
 /* ----------- 池子切换 ----------- */
-$('pool').addEventListener('change', () => {
-  $('codesField').style.display = $('pool').value === '' ? 'block' : 'none';
-});
+/* codesField 现在恒常显示：它不再是「二选一」，而是往池子上「加料」。
+   典型用途是把 002557 洽洽食品补进消费池——它不在任何指数成分股里。 */
+$('pool').addEventListener('change', checkFreshness);
+$('codes').addEventListener('change', checkFreshness);
+document.forms.runForm.end.addEventListener('change', checkFreshness);
 
 /* ----------- 预设按钮 ----------- */
+/* 一律走 document.forms.runForm（按 name 取字段），不用按 id 取元素。
+   教训：这几个字段原先只有 name 没有 id，$('lookback') 返回 null，
+   赋值当场抛 TypeError —— fillPreset 第 4 行就中断，后面几个字段
+   一个都没设上，fillTimingPreset 里的择时参数更是从来没生效过。
+   按钮点了「有反应」（池子切了），所以这个 bug 一直没人发现。 */
+function _setField(form, name, value) {
+  const el = form[name];
+  if (!el) { console.warn('预设按钮：表单里没有字段 ' + name); return; }
+  el.value = value;
+}
+
 function fillPreset(pool, strategy, lookback, top_n, rebalance, benchmark) {
-  $('pool').value = pool;
-  $('pool').dispatchEvent(new Event('change'));
-  $('strategy').value = strategy;
-  $('lookback').value = lookback;
-  $('top_n').value = top_n;
-  $('rebalance').value = rebalance;
-  $('benchmark').value = benchmark;
+  const f = document.forms.runForm;
+  f.pool.value = pool;
+  f.pool.dispatchEvent(new Event('change'));   // 触发数据体检
+  _setField(f, 'strategy', strategy);
+  _setField(f, 'lookback', lookback);
+  _setField(f, 'top_n', top_n);
+  _setField(f, 'rebalance', rebalance);
+  _setField(f, 'benchmark', benchmark);
 }
 
 function fillTimingPreset(pool, strategy, lookback, top_n, rebalance, benchmark, timing, tlb) {
   fillPreset(pool, strategy, lookback, top_n, rebalance, benchmark);
-  $('timing').value = timing;
-  document.forms.runForm.timing_lookback.value = tlb;
+  const f = document.forms.runForm;
+  _setField(f, 'timing', timing);
+  _setField(f, 'timing_lookback', tlb);
   $('timingBox').open = true;
 }
 
@@ -539,6 +603,119 @@ function fillWfPreset() {
 fetch('/api/health').then(r => r.json()).then(h => {
   $('health').textContent = h.ok ? '● 服务在线' : '● 服务异常';
 }).catch(() => { $('health').textContent = '● 服务离线'; });
+
+/* ----------- 数据体检 ----------- */
+/* 为什么值得单独做一块 UI：结束日期默认是 2024-09-09。如果用户不改它就跑
+   「生成调仓清单」，得到的是「假如当时是 2024-09-09 该买什么」——
+   回测照样跑通、清单照样漂亮，但完全不是今天的操作建议。
+   这个模块把「数据最新到哪天 / 你的结束日是不是过时了」摆在按钮旁边。 */
+let freshness = null;
+
+async function checkFreshness() {
+  const f = document.forms.runForm;
+  const bar = $('freshbar');
+  const pool = f.pool.value.trim();
+  const codes = f.codes.value.trim();
+
+  if (!pool && !codes) {
+    freshness = null;
+    bar.className = 'freshbar';
+    $('freshIcon').textContent = '·';
+    $('freshText').textContent = '选个股票池（或填代码），这里会告诉你数据更新到哪天。';
+    $('latestBtn').disabled = true;
+    return;
+  }
+
+  $('freshText').textContent = '正在检查数据…';
+  try {
+    const resp = await fetch('/api/data_freshness', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pool: pool, codes: codes, end: f.end.value.trim() }),
+    });
+    const d = await resp.json();
+    freshness = d.ok ? d : null;
+    renderFreshness(d);
+  } catch (err) {
+    freshness = null;
+    bar.className = 'freshbar warn';
+    $('freshIcon').textContent = '⚠️';
+    $('freshText').textContent = '数据检查失败: ' + String(err);
+    $('latestBtn').disabled = true;
+  }
+}
+
+function renderFreshness(d) {
+  const bar = $('freshbar');
+  if (!d.ok) {
+    bar.className = 'freshbar warn';
+    $('freshIcon').textContent = '⚠️';
+    $('freshText').textContent = d.error || '数据检查失败';
+    $('latestBtn').disabled = true;
+    return;
+  }
+  bar.className = 'freshbar ' + (d.usable ? 'ok' : 'warn');
+  $('freshIcon').textContent = d.usable ? '✓' : '⚠️';
+  // 后端文案是为终端写的，带 **加粗** 标记；网页上换成真的粗体。
+  $('freshText').innerHTML =
+    escapeHtml(d.message).replace(/\*\*(.+?)\*\*/g, '<b>$1</b>');
+  // 已经把结束日对齐到最新数据了就没必要再点那个按钮
+  $('latestBtn').disabled = !d.latest || !!d.usable;
+  $('latestBtn').title = d.latest
+    ? ('把结束日期改成 ' + d.latest) : '没有可用数据';
+}
+
+function useLatestData() {
+  if (!freshness || !freshness.latest) return;
+  document.forms.runForm.end.value = freshness.latest.replace(/-/g, '');
+  checkFreshness();
+}
+
+async function onRefreshData() {
+  const params = collectParams(document.forms.runForm);
+  if (!params.pool && !params.codes) { alert('请先选「股票池」或填「手动代码」'); return; }
+
+  const btn = $('refreshBtn');
+  const old = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '⏳ 更新中…';
+  $('freshbar').className = 'freshbar';
+  $('freshIcon').textContent = '·';
+  $('freshText').textContent = '正在从数据源增量补齐（几十秒到几分钟，取决于池子大小）…';
+
+  try {
+    const resp = await fetch('/api/refresh_data', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(params),
+    });
+    const d = await resp.json();
+    if (d.error) {
+      freshness = null;
+      $('freshbar').className = 'freshbar warn';
+      $('freshIcon').textContent = '⚠️';
+      $('freshText').textContent = '更新失败: ' + d.error;
+      return;
+    }
+    freshness = d;
+    renderFreshness(d);
+  } catch (err) {
+    $('freshbar').className = 'freshbar warn';
+    $('freshIcon').textContent = '⚠️';
+    $('freshText').textContent = '更新失败: ' + String(err);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = old;
+  }
+}
+
+/* 结束日不是最新数据时，在结果区顶部再提醒一次——用户点了按钮之后
+   眼睛就在右边，只把警告留在左侧小字里很容易被忽略。 */
+function freshnessBanner() {
+  if (!freshness || !freshness.ok || freshness.usable) return '';
+  return `<div class="databanner">⚠️ ${escapeHtml(freshness.message)
+    .replace(/\*\*(.+?)\*\*/g, '<b>$1</b>')}</div>`;
+}
 
 /* ----------- 提交 ----------- */
 function collectParams(f) {
@@ -701,7 +878,8 @@ function renderResult(d, summary) {
     { label: m.win_rate?.label || '日胜率', value: fmtPctPlain(m.win_rate?.value), cls: 'muted' },
   ];
 
-  let html = '<div class="metrics">';
+  let html = freshnessBanner();
+  html += '<div class="metrics">';
   [...cards, ...sub].forEach(c => {
     html += `<div class="metric ${c.cls}"><div class="label">${escapeHtml(c.label)}</div><div class="value">${c.value}</div></div>`;
   });
@@ -750,11 +928,11 @@ function renderPlan(d) {
   const sells = rows.filter(r => (Number(r.delta_shares) || 0) < 0);
   const sum = arr => arr.reduce((a, r) => a + (Number(r.amount) || 0), 0);
 
-  let html = '';
+  let html = freshnessBanner();
   if (!rows.length) {
     html += `<div class="verdict">清单是空的。<br/>
       常见原因：基准日<b>不是调仓日</b>，或者当前持仓已经和目标一致。<br/>
-      把「结束日期」改成最近交易日，再生成一次。</div>`;
+      把「结束日期」改成最近交易日，或点左侧「用最新数据」，再生成一次。</div>`;
   } else {
     html += `<div class="verdict">
       基准日 <b>${escapeHtml(d.plan_date || '-')}</b> · 持仓来源：${escapeHtml(d.holding_source || '-')}<br/>
@@ -1072,6 +1250,10 @@ function renderMonthlyChart(d) {
 window.addEventListener('resize', () => {
   Object.values(charts).forEach(c => c && c.resize());
 });
+
+/* 页面一打开就体检一次：默认结束日是 2024-09-09，让用户第一眼就看见
+   「数据其实到 2026-09-10 了」，而不是跑完才发现拿的是历史回放。 */
+checkFreshness();
 </script>
 
 </body>
