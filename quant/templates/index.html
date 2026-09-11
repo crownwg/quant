@@ -203,6 +203,41 @@
   }
   .preset:hover { color: var(--accent); border-color: var(--accent); }
 
+  /* 表格 */
+  .tbl { width: 100%; border-collapse: collapse; font-size: 12px; }
+  .tbl th, .tbl td {
+    padding: 8px 10px; text-align: right;
+    border-bottom: 1px solid var(--border); white-space: nowrap;
+  }
+  .tbl th { color: var(--muted); font-weight: 500; }
+  .tbl th:first-child, .tbl td:first-child { text-align: left; }
+  .tbl tbody tr:hover td { background: rgba(255,255,255,0.025); }
+  .tbl tr.hl td { background: rgba(245, 166, 35, 0.09); }
+  .tbl td.pos { color: var(--red); }
+  .tbl td.neg { color: var(--green); }
+
+  /* 结论块 */
+  .verdict {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--accent);
+    border-radius: 8px;
+    padding: 14px 18px;
+    margin-bottom: 16px;
+    font-size: 13px;
+    line-height: 1.8;
+  }
+  .verdict b { color: var(--accent); font-weight: 600; }
+
+  /* 文件链接 */
+  .links { margin-top: 14px; display: flex; gap: 10px; flex-wrap: wrap; }
+  .links a.dl {
+    font-size: 12px; padding: 7px 12px;
+    background: var(--surface-2); border: 1px solid var(--border);
+    border-radius: 6px; color: var(--accent); text-decoration: none;
+  }
+  .links a.dl:hover { border-color: var(--accent); }
+
   footer {
     padding: 16px 28px;
     color: var(--muted);
@@ -228,7 +263,9 @@
       <span class="preset" onclick="fillPreset('消费', 'momentum', 120, 15, 'M', 'sh000932')">消费·动量120</span>
       <span class="preset" onclick="fillPreset('消费', 'reversal', 20, 15, 'M', 'sh000932')">消费·反转20</span>
       <span class="preset" onclick="fillPreset('hs300', 'momentum', 120, 20, 'M', 'sh000300')">沪深300·动量120</span>
-      <span class="preset" onclick="fillPreset('hs300', 'reversal', 20, 20, 'M', 'sh000300')">沪深300·反转20</span>
+      <span class="preset" onclick="fillTimingPreset('消费','momentum',120,15,'M','sh000932','ma',60)">消费·加择时 ma60</span>
+      <span class="preset" onclick="fillTimingPreset('hs300','momentum',120,20,'M','sh000300','dual',120)">沪深300·加择时 dual</span>
+      <span class="preset" onclick="fillWfPreset()">消费·样本外验证</span>
     </div>
 
     <form id="runForm" onsubmit="return onSubmit(event)">
@@ -315,6 +352,88 @@
         </select>
       </div>
 
+      <details id="timingBox">
+        <summary>仓位管理 · 择时 / 风险</summary>
+
+        <div class="field">
+          <label>趋势择时（下跌时自动降仓）</label>
+          <select name="timing" id="timing">
+            <option value="off" selected>off · 不择时，始终满仓</option>
+            <option value="ma">ma · 价格 vs 均线（最稳）</option>
+            <option value="momentum">momentum · 动量方向（最激进）</option>
+            <option value="dual">dual · 均线 + 斜率双确认（最保守）</option>
+          </select>
+        </div>
+
+        <div class="field-row">
+          <div class="field">
+            <label>均线 / 动量长度</label>
+            <input type="number" name="timing_lookback" value="120" min="10" max="400">
+          </div>
+          <div class="field">
+            <label>滞回带 %（防抖动）</label>
+            <input type="number" name="timing_band" value="0" min="0" max="20" step="0.5">
+          </div>
+        </div>
+
+        <div class="field-row">
+          <div class="field">
+            <label>看空时最低仓位 %</label>
+            <input type="number" name="timing_min_exposure" value="0" min="0" max="100">
+          </div>
+          <div class="field">
+            <label>最高仓位 %</label>
+            <input type="number" name="timing_max_exposure" value="100" min="0" max="100">
+          </div>
+        </div>
+
+        <div class="field">
+          <label>波动率目标 %（0 = 关闭）</label>
+          <input type="number" name="vol_target" value="0" min="0" max="100">
+        </div>
+
+        <div class="field">
+          <label>当「市场」用的指数</label>
+          <input type="text" name="timing_proxy" value="auto" placeholder="auto，或填 000932">
+        </div>
+
+        <div class="meta">
+          实测：<b>ma</b> 那一类最稳，<b>momentum</b> 那一类跨时间段容易翻车。<br>
+          具体数字（几日均线、几个点滞回）不要照抄，换段时间就不一样。
+        </div>
+      </details>
+
+      <details id="wfBox">
+        <summary>样本外验证 · 参数到底可不可信</summary>
+
+        <div class="field check">
+          <input type="checkbox" name="walk_forward" id="walk_forward">
+          <label for="walk_forward" style="margin: 0">跑 5 折样本外（慢，但能识破拟合）</label>
+        </div>
+
+        <div class="field-row">
+          <div class="field">
+            <label>训练窗（年）</label>
+            <input type="number" name="fw_train" value="2" min="0.5" max="5" step="0.5">
+          </div>
+          <div class="field">
+            <label>测试窗（年）</label>
+            <input type="number" name="fw_test" value="0.5" min="0.25" max="2" step="0.25">
+          </div>
+        </div>
+
+        <div class="field">
+          <label>要一起扫的择时模式</label>
+          <input type="text" name="grid_timing" value="off,ma,momentum,dual"
+                 placeholder="off,ma,momentum,dual">
+        </div>
+
+        <div class="meta">
+          思路：用前 2 年的数据选参数，用紧接着的半年验证它，
+          然后往前滚。这样选出来的参数<b>没见过</b>测试段的数据，才叫诚实。
+        </div>
+      </details>
+
       <div class="field check">
         <input type="checkbox" name="use_open" id="use_open" checked>
         <label for="use_open" style="margin: 0">用次日开盘价成交（避免未来函数）</label>
@@ -365,6 +484,19 @@ function fillPreset(pool, strategy, lookback, top_n, rebalance, benchmark) {
   $('benchmark').value = benchmark;
 }
 
+function fillTimingPreset(pool, strategy, lookback, top_n, rebalance, benchmark, timing, tlb) {
+  fillPreset(pool, strategy, lookback, top_n, rebalance, benchmark);
+  $('timing').value = timing;
+  document.forms.runForm.timing_lookback.value = tlb;
+  $('timingBox').open = true;
+}
+
+function fillWfPreset() {
+  fillTimingPreset('消费', 'momentum', 120, 15, 'M', 'sh000932', 'off', 60);
+  document.forms.runForm.walk_forward.checked = true;
+  $('wfBox').open = true;
+}
+
 /* ----------- 健康检查 ----------- */
 fetch('/api/health').then(r => r.json()).then(h => {
   $('health').textContent = h.ok ? '● 服务在线' : '● 服务异常';
@@ -377,6 +509,10 @@ async function onSubmit(e) {
   const pool = f.pool.value.trim();
   const codes = f.codes.value.trim();
   if (!pool && !codes) { alert('请填写「股票池」或「手动代码」'); return false; }
+  const num = (name, dflt) => {
+    const v = parseFloat(f[name] ? f[name].value : '');
+    return isNaN(v) ? dflt : v;
+  };
   const params = {
     pool: pool,
     codes: codes,
@@ -389,13 +525,34 @@ async function onSubmit(e) {
     end: f.end.value.trim(),
     use_open: f.use_open.checked,
     benchmark: f.benchmark.value,
+    // 仓位管理（页面填百分数，后端收小数）
+    timing: f.timing.value,
+    timing_lookback: parseInt(f.timing_lookback.value) || 120,
+    timing_band: num('timing_band', 0) / 100,
+    timing_min_exposure: num('timing_min_exposure', 0) / 100,
+    timing_max_exposure: num('timing_max_exposure', 100) / 100,
+    vol_target: num('vol_target', 0) / 100,
+    timing_proxy: (f.timing_proxy.value || '').trim() || 'auto',
+    // 样本外验证
+    walk_forward: f.walk_forward.checked,
+    fw_train: num('fw_train', 2),
+    fw_test: num('fw_test', 0.5),
+    grid_timing: (f.grid_timing.value || '').trim(),
   };
-  const summary = `${params.pool || params.codes} · ${params.strategy} · lookback=${params.lookback} · top${params.top_n}`;
+
+  const tpart = params.timing === 'off'
+    ? '' : ` · 择时 ${params.timing}(${params.timing_lookback})`;
+  const vpart = params.vol_target > 0 ? ` · 波动目标 ${(params.vol_target * 100).toFixed(0)}%` : '';
+  const summary = `${params.pool || params.codes} · ${params.strategy}`
+    + ` · lookback=${params.lookback} · top${params.top_n}${tpart}${vpart}`;
+
   $('result').innerHTML = `
     <div class="loading">
       <div class="spinner"></div>
-      <div class="params-hint">回测中：${summary}</div>
-      <div class="hint">首次运行需要拉数据，请耐心等待（HS300 大池约 1-2 分钟）。</div>
+      <div class="params-hint">${params.walk_forward ? '样本外验证中' : '回测中'}：${escapeHtml(summary)}</div>
+      <div class="hint">${params.walk_forward
+        ? '要跑多个训练/测试折，通常需要几分钟到十几分钟。'
+        : '首次运行需要拉数据，请耐心等待（HS300 大池约 1-2 分钟）。'}</div>
     </div>`;
   $('submitBtn').disabled = true;
   $('submitBtn').textContent = '⏳ 运行中...';
@@ -409,6 +566,8 @@ async function onSubmit(e) {
     const data = await resp.json();
     if (data.error) {
       $('result').innerHTML = `<div class="error">${escapeHtml(data.error)}</div>`;
+    } else if (data.mode === 'walk_forward') {
+      renderWfResult(data, summary, params);
     } else {
       renderResult(data, summary);
     }
@@ -427,24 +586,36 @@ function escapeHtml(s) {
   }[c]));
 }
 
-/* ----------- 渲染结果 ----------- */
+/* ----------- 通用格式化（A 股习惯：涨=红，跌=绿） ----------- */
+const fmtPct = v => (v == null || isNaN(v)) ? '-' : (v >= 0 ? '+' : '') + (v * 100).toFixed(1) + '%';
+const fmtPctPlain = v => (v == null || isNaN(v)) ? '-' : (v * 100).toFixed(1) + '%';
+const fmtNum = v => (v == null || isNaN(v)) ? '-' : v.toFixed(2);
+const cls = v => (v == null || isNaN(v)) ? 'muted' : (v >= 0 ? 'red' : 'green');
+const clsHi = (v, hi) => (v == null || isNaN(v)) ? 'muted' : (v >= hi ? 'red' : (v < 0 ? 'green' : 'muted'));
+
+function fileLinks(d) {
+  const out = [];
+  if (d.report_file) out.push(`<a class="dl" href="/report/${encodeURIComponent(d.report_file)}" target="_blank">完整报告</a>`);
+  if (d.summary_file) out.push(`<a class="dl" href="/download/${encodeURIComponent(d.summary_file)}">汇总 CSV</a>`);
+  if (d.folds_file) out.push(`<a class="dl" href="/download/${encodeURIComponent(d.folds_file)}">逐折 CSV</a>`);
+  return out.length ? `<div class="links">${out.join('')}</div>` : '';
+}
+
+/* ----------- 渲染结果：单次回测 ----------- */
 function renderResult(d, summary) {
   const m = d.metrics || {};
-  const fmtPct = v => (v == null || isNaN(v)) ? '-' : (v >= 0 ? '+' : '') + (v * 100).toFixed(1) + '%';
-  const fmtNum = v => (v == null || isNaN(v)) ? '-' : v.toFixed(2);
-  const cls = v => v == null || isNaN(v) ? 'muted' : (v >= 0 ? 'green' : 'red');
 
   const cards = [
     { label: m.total_return?.label || '总收益', value: fmtPct(m.total_return?.value), cls: cls(m.total_return?.value) },
-    { label: m.sharpe?.label || '夏普', value: fmtNum(m.sharpe?.value), cls: m.sharpe?.value >= 1 ? 'green' : 'muted' },
+    { label: m.sharpe?.label || '夏普', value: fmtNum(m.sharpe?.value), cls: clsHi(m.sharpe?.value, 1) },
     { label: m.max_drawdown?.label || '最大回撤', value: fmtPct(m.max_drawdown?.value), cls: cls(m.max_drawdown?.value) },
     { label: m.excess_return?.label || '超额收益', value: fmtPct(m.excess_return?.value), cls: cls(m.excess_return?.value) },
   ];
   const sub = [
     { label: m.annual_return?.label || '年化', value: fmtPct(m.annual_return?.value), cls: cls(m.annual_return?.value) },
-    { label: m.annual_volatility?.label || '年化波动', value: fmtPct(m.annual_volatility?.value), cls: 'muted' },
-    { label: m.information_ratio?.label || '信息比率', value: fmtNum(m.information_ratio?.value), cls: m.information_ratio?.value >= 0.5 ? 'green' : 'muted' },
-    { label: m.win_rate?.label || '日胜率', value: fmtPct(m.win_rate?.value), cls: cls(m.win_rate?.value) },
+    { label: m.annual_volatility?.label || '年化波动', value: fmtPctPlain(m.annual_volatility?.value), cls: 'muted' },
+    { label: m.information_ratio?.label || '信息比率', value: fmtNum(m.information_ratio?.value), cls: clsHi(m.information_ratio?.value, 0.5) },
+    { label: m.win_rate?.label || '日胜率', value: fmtPctPlain(m.win_rate?.value), cls: 'muted' },
   ];
 
   let html = '<div class="metrics">';
@@ -453,12 +624,26 @@ function renderResult(d, summary) {
   });
   html += '</div>';
 
+  const ex = d.exposure || {};
+  if (Object.keys(ex).length) {
+    html += `<div class="chart-card" style="margin-bottom:16px">
+      <div class="chart-title">仓位管理效果（启用择时 / 波动率目标后才有）</div>
+      <div class="metrics" style="margin:0">
+        <div class="metric muted"><div class="label">平均仓位</div><div class="value">${fmtPctPlain(ex.avg_exposure?.value)}</div></div>
+        <div class="metric muted"><div class="label">在场时间占比</div><div class="value">${fmtPctPlain(ex.in_market_ratio?.value)}</div></div>
+        <div class="metric muted"><div class="label">仓位切换次数</div><div class="value">${ex.exposure_switches?.value ?? '-'}</div></div>
+        <div class="metric muted"><div class="label">年化收益</div><div class="value">${fmtPct(m.annual_return?.value)}</div></div>
+      </div>
+    </div>`;
+  }
+
   html += `<div class="charts">
     <div class="chart-card"><div class="chart-title">净值曲线 · 策略 vs 基准</div><div class="chart chart-tall" id="eqChart"></div></div>
     <div class="chart-card"><div class="chart-title">回撤曲线</div><div class="chart" id="ddChart"></div></div>
     <div class="chart-card"><div class="chart-title">分年度收益</div><div class="chart" id="annualChart"></div></div>
     <div class="chart-card"><div class="chart-title">月度收益热力图</div><div class="chart chart-tall" id="monthlyChart"></div></div>
   </div>`;
+  html += fileLinks(d);
   html += `<div class="meta">回测: ${escapeHtml(summary)} · 数据条数: ${d.dates?.length || 0} · 输出前缀: ${escapeHtml(d.prefix || '-')}</div>`;
 
   $('result').innerHTML = html;
@@ -467,6 +652,115 @@ function renderResult(d, summary) {
   renderDrawdownChart(d);
   renderAnnualChart(d);
   renderMonthlyChart(d);
+}
+
+/* ----------- 渲染结果：样本外验证（walk-forward） ----------- */
+const ARM_LABEL = {
+  walk_forward: '只挑最好的 1 个',
+  smooth: '邻域平滑选参',
+  full_sample_best: '事后选参（不可实现）',
+  default: '默认参数（不调参）',
+};
+function armLabel(r) {
+  if (ARM_LABEL[r.key]) return ARM_LABEL[r.key];
+  const k = String(r.key);
+  if (k.startsWith('ens')) {
+    return k === 'ensall' ? '摊开：全部候选' : `摊开：前 ${k.slice(3)} 名`;
+  }
+  return r.strategy;
+}
+const cellPct = v => `<td class="${v == null || isNaN(v) ? '' : (v >= 0 ? 'pos' : 'neg')}">${fmtPct(v)}</td>`;
+
+function renderWfResult(d, summary) {
+  const rows = d.summary || [];
+  const folds = d.folds || [];
+  if (!rows.length) {
+    $('result').innerHTML = `<div class="error">没有拿到样本外结果。</div>`;
+    return;
+  }
+  const byKey = {};
+  rows.forEach(r => { byKey[r.key] = r; });
+  const ensKeys = rows.filter(r => String(r.key).startsWith('ens')).map(r => r.key);
+  const bestEns = ensKeys.length
+    ? ensKeys.reduce((a, b) => (byKey[b].total_return > byKey[a].total_return ? b : a))
+    : null;
+  const base = byKey.walk_forward || rows[0];
+  const fsb = byKey.full_sample_best;
+
+  // ---- 结论区 ----
+  let vHtml = `<div class="verdict">`;
+  vHtml += `<b>同一段测试区间，唯一差别是「参数怎么选」</b><br/>`;
+  vHtml += `只挑历史最好的 1 个：样本外 ${fmtPct(base.total_return)}`;
+  if (bestEns) {
+    const gain = byKey[bestEns].total_return - base.total_return;
+    vHtml += ` → 换成摊开前几名：${fmtPct(byKey[bestEns].total_return)}（${gain >= 0 ? '+' : ''}${(gain * 100).toFixed(1)} 个百分点）`;
+  }
+  vHtml += `<br/>`;
+
+  // 回撤：集成臂的共同特征
+  const ensDds = ensKeys.map(k => byKey[k].worst_fold_drawdown).filter(v => v != null);
+  const bestDd = ensDds.length ? Math.max(...ensDds) : null;
+  if (bestDd != null) {
+    vHtml += `<b>最可信的一条</b>：最差一段的亏损从 ${fmtPct(base.worst_fold_drawdown)} 收窄到 ${fmtPct(bestDd)}——`;
+    vHtml += `只要「摊开」而不是押一个，回撤就改善，跟摊几个无关。<br/>`;
+  }
+  if (fsb) {
+    vHtml += `<span style="color:var(--muted)">参考：事后选参（先看了答案再挑参数）能报 ${fmtPct(fsb.total_return)}，`;
+    vHtml += `这个数字实盘拿不到，差距越大说明参数越是拟合出来的。</span>`;
+  }
+  vHtml += `</div>`;
+
+  // ---- 各臂汇总表 ----
+  let sHtml = `<div class="chart-card" style="margin-bottom:16px; overflow-x:auto">
+    <div class="chart-title">各做法对比（按样本外总收益）</div>
+    <table class="tbl"><thead><tr>
+      <th>做法</th><th>总收益</th><th>年化</th><th>平均夏普</th><th>最差一段</th><th>正收益折</th>
+    </tr></thead><tbody>`;
+  [...rows].sort((a, b) => b.total_return - a.total_return).forEach(r => {
+    const isEns = String(r.key).startsWith('ens');
+    const isBest = bestEns && r.key === bestEns;
+    sHtml += `<tr class="${isBest ? 'hl' : ''}">
+      <td>${escapeHtml(armLabel(r))}</td>
+      ${cellPct(r.total_return)}
+      ${cellPct(r.annual_return)}
+      <td>${fmtNum(r.avg_sharpe)}</td>
+      ${cellPct(r.worst_fold_drawdown)}
+      <td>${r.positive_folds == null ? '-' : (r.positive_folds * 100).toFixed(0) + '%'}</td>
+    </tr>`;
+  });
+  sHtml += `</tbody></table>
+    <div class="meta">「事后选参」是唯一不诚实的行——它先看了全样本结果再挑参数，只能当上限参考。</div>
+  </div>`;
+
+  // ---- 逐折明细 ----
+  const ensCols = folds.length
+    ? Object.keys(folds[0]).filter(k => k.startsWith('test_return_ens'))
+    : [];
+  let fHtml = '';
+  if (folds.length) {
+    fHtml = `<div class="chart-card" style="overflow-x:auto">
+      <div class="chart-title">逐折明细（训练窗选参数 → 紧邻测试窗验证）</div>
+      <table class="tbl"><thead><tr>
+        <th>折</th><th>测试区间</th><th>训练窗选中的参数</th><th>只挑1个</th><th>平滑选参</th>
+        ${ensCols.map(c => `<th>${escapeHtml(armLabel({ key: c.replace('test_return_', '') }))}</th>`).join('')}
+      </tr></thead><tbody>`;
+    folds.forEach(f => {
+      fHtml += `<tr>
+        <td>${f.fold}</td>
+        <td>${escapeHtml(String(f.test_start || '').slice(0, 10))} ~ ${escapeHtml(String(f.test_end || '').slice(0, 10))}</td>
+        <td style="white-space:normal; color:var(--muted)">${escapeHtml(f.chosen || '')}</td>
+        ${cellPct(f.test_return)}
+        ${cellPct(f.test_return_smooth)}
+        ${ensCols.map(c => cellPct(f[c])).join('')}
+      </tr>`;
+    });
+    fHtml += `</tbody></table>
+      <div class="meta">每一折都只用了它自己想当年份的数据选参数，测试段的数据没参与选择——这才叫样本外。</div>
+    </div>`;
+  }
+
+  $('result').innerHTML = vHtml + sHtml + fHtml + fileLinks(d)
+    + `<div class="meta">${escapeHtml(summary)} · 输出前缀: ${escapeHtml(d.prefix || '-')}</div>`;
 }
 
 /* ----------- ECharts: 净值对比 ----------- */
@@ -573,7 +867,7 @@ function renderAnnualChart(d) {
     series: [
       { name: '年度收益', type: 'bar', data: rets,
         itemStyle: {
-          color: (p) => p.data >= 0 ? '#16c060' : '#ef4146',
+          color: (p) => p.data >= 0 ? '#ef4146' : '#16c060',
           borderRadius: [4, 4, 0, 0],
         },
         label: { show: true, position: 'top', color: '#e6ecf5', fontSize: 11,
@@ -618,7 +912,7 @@ function renderMonthlyChart(d) {
     visualMap: {
       min: -maxAbs, max: maxAbs,
       calculable: true, orient: 'horizontal', left: 'center', bottom: 0,
-      inRange: { color: ['#ef4146', '#1c2a47', '#16c060'] },
+      inRange: { color: ['#16c060', '#1c2a47', '#ef4146'] },
       textStyle: { color: '#8b9bbd' },
       formatter: v => v.toFixed(0) + '%',
     },
