@@ -253,6 +253,51 @@ def smooth_scores(scores: list[float], neighbors: list[list[int]]) -> list[float
     return out
 
 
+def parse_ensemble_ks(text) -> tuple[int | None, ...]:
+    """解析 --wf-ensemble-k，如 '3,5,10,0' → (3, 5, 10, None)；0 表示「全部候选」。
+
+    为什么要有 K 这一维：无差别平均**全部**候选会把已知最差的区域也算进来
+    （实测 momentum 组的平均夏普只有 0.39、半数窗口亏钱，却被等权持有），
+    集成被拖累成「收益平庸、只换来回撤最小」。
+    只在训练窗表现靠前的 K 组里集成，等于把「哪个区域好」这个稳健信息用上，
+    同时仍然不押单点。K=1 退化为「按平滑分数选参」，K=全部就是原来的做法。
+
+    幂等性：本函数必须能吃下**自己的输出**（`(3, 5, 10, None)`），因为调用方
+    （main.py）先解析一次再把结果传给 walk_forward_search，后者内部还会再解析一次。
+    早期版本在这里 `int(None)` 直接崩 —— 单测只喂过字符串，所以没暴露。
+    """
+    if text is None:
+        return (3, 5, 10, None)
+    if isinstance(text, (list, tuple)):
+        items = list(text)
+    else:
+        items = [x.strip() for x in str(text).split(",") if x.strip()]
+    ks: list[int | None] = []
+    for it in items:
+        if it is None:
+            k: int | None = None
+        else:
+            try:
+                k = int(it)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"--wf-ensemble-k 含非法值 {it!r}，应为整数或 0(all)") from exc
+            k = None if k <= 0 else k
+        if k not in ks:
+            ks.append(k)
+    return tuple(ks) if ks else (3, 5, 10, None)
+
+
+def ensemble_arm_keys(ks: tuple[int | None, ...]) -> list[str]:
+    """把 K 列表映射成报告用的臂名（稳定顺序，便于图表配色）。"""
+    return [f"ens{'all' if k is None else k}" for k in ks]
+
+
+def ensemble_arm_label(k: int | None, n_combos: int = 0) -> str:
+    if k is None:
+        return f"参数集成（全部 {n_combos} 组等权）" if n_combos else "参数集成（全部候选等权）"
+    return f"参数集成（平滑分前 {k} 组等权）"
+
+
 def ensemble_weights(weight_list: list[pd.DataFrame]) -> pd.DataFrame:
     """把多个参数组合的权重矩阵等权平均 —— 「同时按所有候选参数持有」。
 
@@ -399,13 +444,15 @@ def walk_forward_search(prices_all: pd.DataFrame, open_all: pd.DataFrame,
                         timing_lookbacks: list[int] | None = None,
                         timing_bands: list[float] | None = None,
                         proxy: pd.Series | None = None,
+                        ensemble_ks: tuple[int | None, ...] | None = None,
                         periods_per_year: int = 252) -> dict:
     """滚动训练/测试的样本外验证。
 
     返回 dict：
       folds      每折明细 DataFrame（含三种选参方式的选中参数与样本外表现）
-      curves     五条测试期拼接净值：walk_forward(训练窗 argmax) / smooth(邻域平滑)
-                 / ensemble(全组合等权集成) / full_sample_best(事后选参) / default(不调参)
+      curves     多条测试期拼接净值：walk_forward(训练窗 argmax) / smooth(邻域平滑)
+                 / ens<k>(按平滑分取前 k 组等权集成，ensall = 全部候选)
+                 / full_sample_best(事后选参) / default(不调参)
       summary    五条曲线的汇总指标 DataFrame（带 key 列，报告按 key 取用）
       timing_note    各折选中的择时模式统计（搜索空间含 off 时才有意义）
       ensemble_note  平滑/集成相对 argmax 的改善——「别踩尖峰」的直接证据
@@ -508,28 +555,45 @@ def walk_forward_search(prices_all: pd.DataFrame, open_all: pd.DataFrame,
     print(f"\n【Walk-Forward】{len(folds)} 折，训练 {train_n} 日 / 测试 {test_n} 日"
           f"（选参依据：训练期 {select_metric}）")
     fold_rows = []
-    arms = ("walk_forward", "smooth", "ensemble", "full_sample_best", "default")
+    ks = parse_ensemble_ks(ensemble_ks) if ensemble_ks is not None else (3, 5, 10, None)
+    ens_keys = ensemble_arm_keys(ks)
+    arms = ("walk_forward", "smooth", *ens_keys, "full_sample_best", "default")
     curves: dict[str, list] = {k: [] for k in arms}
+    # 最窄那条集成臂的组数（与折无关，先算好，供逐折记录与汇总说明使用）
+    min_k = min([len(combos) if k is None else min(int(k), len(combos)) for k in ks])
     for fi, (s, se, te) in enumerate(folds, 1):
         # 训练窗：把所有候选都跑一遍（后面 argmax / 邻域平滑 / 集成都要用）
         train_ms = [run_combo(combo, se, s, se)[1] for combo in combos]
         scores = [float(m[select_metric]) for m in train_ms]
+        smoothed = smooth_scores(scores, neighbors)
 
         best_i = int(np.argmax(scores))
         wf_combo, wf_train_m = combos[best_i], train_ms[best_i]
-        sm_i = int(np.argmax(smooth_scores(scores, neighbors)))
+        sm_i = int(np.argmax(smoothed))
         sm_combo, sm_train_m = combos[sm_i], train_ms[sm_i]
 
         _, m_wf = run_combo(wf_combo, te, se, te)
         _, m_sm = run_combo(sm_combo, te, se, te)
-        # 集成臂：所有候选的权重等权平均 → 一笔净额委托（成本只算一次）
-        w_ens = ensemble_weights([build_weights(c, te) for c in combos])
-        _, m_en = run_weights(w_ens, se, te)
-        _, m_fb = run_combo(full_best_combo, te, se, te)
-        _, m_df = run_combo(default_combo, te, se, te)
+
+        # 集成臂：先按**平滑分**降序（不是原始分——原始分会被尖峰带偏），
+        # 再取前 k 组把权重等权平均 → 一笔净额委托（成本只算一次）。
+        # 各组合的权重算一次就够，所有 K 共用（K=全部时正好是全集）。
+        order = list(np.argsort(-np.asarray(smoothed, dtype=float)))
+        w_cache = {i: build_weights(combos[i], te) for i in range(len(combos))}
+        # 最窄那条集成臂到底持有了哪几组？这是「集成是不是只押了一个择时模式」的
+        # 直接证据——若前 3 组全是 ma，那 ens3 实质接近「只做 ma」，结构结论就成立。
+        top_picks = " / ".join(combo_label(combos[i]) for i in order[:min_k])
+        top_modes = [combos[i].get("timing", "off") for i in order[:min_k]]
+        ens_ms: dict[str, dict] = {}
+        for k, key in zip(ks, ens_keys):
+            picked = order if k is None else order[:min(int(k), len(order))]
+            _, m_k = run_weights(ensemble_weights([w_cache[i] for i in picked]), se, te)
+            ens_ms[key] = m_k
+        m_fb = run_combo(full_best_combo, te, se, te)[1]
+        m_df = run_combo(default_combo, te, se, te)[1]
 
         # 记录测试期的净值（后续按年化收益拼接成连续曲线）
-        for key, m in (("walk_forward", m_wf), ("smooth", m_sm), ("ensemble", m_en),
+        for key, m in (("walk_forward", m_wf), ("smooth", m_sm), *ens_ms.items(),
                        ("full_sample_best", m_fb), ("default", m_df)):
             curves[key].append((se, te, m["sharpe"], m["total_return"], m["max_drawdown"]))
 
@@ -544,6 +608,8 @@ def walk_forward_search(prices_all: pd.DataFrame, open_all: pd.DataFrame,
             "timing_band": wf_combo.get("timing_band", 0.0),
             "chosen": combo_label(wf_combo),
             "smooth_chosen": combo_label(sm_combo),
+            "ens_top": top_picks,
+            "ens_top_modes": "+".join(top_modes),
             "train_sharpe": round(float(wf_train_m["sharpe"]), 3),
             "train_return": round(float(wf_train_m["total_return"]), 4),
             "test_sharpe": round(float(m_wf["sharpe"]), 3),
@@ -551,15 +617,17 @@ def walk_forward_search(prices_all: pd.DataFrame, open_all: pd.DataFrame,
             "test_max_drawdown": round(float(m_wf["max_drawdown"]), 4),
             "decay": round(float(m_wf["sharpe"] - wf_train_m["sharpe"]), 3),
             "test_return_smooth": round(float(m_sm["total_return"]), 4),
-            "test_return_ensemble": round(float(m_en["total_return"]), 4),
+            **{f"test_return_{key}": round(float(ens_ms[key]["total_return"]), 4)
+               for key in ens_keys},
         })
+        ens_desc = " / ".join(f"{key} {ens_ms[key]['total_return']:.1%}" for key in ens_keys)
         print(f"  第{fi}折 {idx_all[s].date()}~{idx_all[se-1].date()} 选参"
               f" {combo_label(wf_combo)}"
               f" | 样本内夏普 {wf_train_m['sharpe']:.2f} → 样本外 {m_wf['sharpe']:.2f}"
               f"（衰减 {fold_rows[-1]['decay']:+.2f}）"
               f" | 样本外收益 argmax {m_wf['total_return']:.1%}"
               f" / 邻域 {m_sm['total_return']:.1%}"
-              f" / 集成 {m_en['total_return']:.1%}", flush=True)
+              f" / {ens_desc}", flush=True)
 
     folds_df = pd.DataFrame(fold_rows)
 
@@ -570,6 +638,13 @@ def walk_forward_search(prices_all: pd.DataFrame, open_all: pd.DataFrame,
         timing_note = "各折选中的择时模式：" + "、".join(
             f"{k} × {v}" for k, v in counts.items())
 
+    # ---- 最窄集成臂实际持有了哪些模式（回答「集成是不是只押了一个模式」）----
+    ens_note = ""
+    if len(folds_df) and "ens_top_modes" in folds_df.columns and search_timing:
+        picks = folds_df["ens_top_modes"].value_counts()
+        ens_note = ("最窄集成臂（前 %d 组）各折持有：" % min_k) + "、".join(
+            f"{k} × {v}" for k, v in picks.items())
+
     # ---- 拼接测试期净值（按各段收益连乘）----
     def chain(records):
         eq = [1.0]
@@ -578,11 +653,12 @@ def walk_forward_search(prices_all: pd.DataFrame, open_all: pd.DataFrame,
         return eq
 
     summary_rows = []
-    for key, label in (("walk_forward", "Walk-Forward 自适应参数（训练窗 argmax）"),
-                       ("smooth", "Walk-Forward 邻域平滑选参（不踩尖峰）"),
-                       ("ensemble", "参数集成（全组合等权持有，不做选择）"),
-                       ("full_sample_best", "全样本最优固定参数（事后选参）"),
-                       ("default", "默认参数（不调参）")):
+    label_map = [("walk_forward", "Walk-Forward 自适应参数（训练窗 argmax）"),
+                 ("smooth", "Walk-Forward 邻域平滑选参（不踩尖峰）")]
+    label_map += [(key, ensemble_arm_label(k, len(combos))) for k, key in zip(ks, ens_keys)]
+    label_map += [("full_sample_best", "全样本最优固定参数（事后选参）"),
+                  ("default", "默认参数（不调参）")]
+    for key, label in label_map:
         recs = curves[key]
         chain_vals = chain(recs)
         total = float(chain_vals[-1] - 1)
@@ -608,20 +684,52 @@ def walk_forward_search(prices_all: pd.DataFrame, open_all: pd.DataFrame,
 
     # ---- 集成/平滑相对 argmax 的改善（若有，就是「别踩尖峰」的直接证据）----
     ensemble_note = ""
+    ensemble_k_curve: list[dict] = []
     if summary_df is not None and len(summary_df):
         by_key = summary_df.set_index("key")
         try:
-            d_arg = by_key.loc["walk_forward", "total_return"]
+            d_arg = float(by_key.loc["walk_forward", "total_return"])
             parts = []
-            for k, name in (("smooth", "邻域平滑"), ("ensemble", "全组合集成")):
-                if k in by_key.index:
-                    dd = float(by_key.loc[k, "total_return"]) - float(d_arg)
-                    parts.append(f"{name} {dd:+.1%}")
+            if "smooth" in by_key.index:
+                dd = float(by_key.loc["smooth", "total_return"]) - d_arg
+                parts.append(f"邻域平滑 {dd:+.1%}")
+            for k, key in zip(ks, ens_keys):
+                if key in by_key.index:
+                    kk = len(combos) if k is None else min(int(k), len(combos))
+                    ret = float(by_key.loc[key, "total_return"])
+                    ensemble_k_curve.append({
+                        "k": kk, "key": key,
+                        "total_return": ret, "avg_sharpe": float(by_key.loc[key, "avg_sharpe"]),
+                        "worst_fold_drawdown": float(by_key.loc[key, "worst_fold_drawdown"]),
+                        "vs_argmax": ret - d_arg,
+                    })
+            if ensemble_k_curve:
+                lo = min(ensemble_k_curve, key=lambda r: r["total_return"])
+                hi = max(ensemble_k_curve, key=lambda r: r["total_return"])
+                if len(ensemble_k_curve) > 1:
+                    # 报区间而不是只报最好看的那个 K —— 单点数字会诱导「挑最优 K」。
+                    parts.append(f"集成 K={hi['k']}~{lo['k']}：{hi['vs_argmax']:+.1%} ~ "
+                                 f"{lo['vs_argmax']:+.1%}（极差 "
+                                 f"{hi['total_return'] - lo['total_return']:.1%}）")
+                else:
+                    parts.append(f"集成 K={hi['k']} {hi['vs_argmax']:+.1%}")
             if parts:
                 ensemble_note = ("样本外总收益相对「训练窗 argmax」的变化：" + "，".join(parts)
                                  + "（正则说明单点择优确实在踩噪声）")
         except KeyError:
             ensemble_note = ""
+
+    # ---- K 敏感度：同一个 K 只在同一批测试窗上比较，本身也是「选参」 ----
+    k_note = ""
+    if len(ensemble_k_curve) >= 3:
+        vals = [r["total_return"] for r in ensemble_k_curve]
+        spread = max(vals) - min(vals)
+        k_note = (f"集成 K 的收益极差 {spread:.1%}（最差 K={min(ensemble_k_curve, key=lambda r: r['total_return'])['k']}，"
+                  f"最优 K={max(ensemble_k_curve, key=lambda r: r['total_return'])['k']}）"
+                  + ("——极差不大，说明集成度这个选择不敏感，结论稳。"
+                     if spread <= 0.05 else
+                     "——极差较大，别事后挑最好的 K（那又是一次过拟合），"
+                     "应按原理选：K 越大方差越小、期望越被摊薄。"))
 
     return {
         "folds": folds_df,
@@ -632,7 +740,10 @@ def walk_forward_search(prices_all: pd.DataFrame, open_all: pd.DataFrame,
         "full_best_label": combo_label(full_best_combo),
         "default_label": combo_label(default_combo),
         "timing_note": timing_note,
+        "ens_note": ens_note,
         "ensemble_note": ensemble_note,
+        "ensemble_k_curve": ensemble_k_curve,
+        "k_note": k_note,
         "search_timing": search_timing,
         "n_combos": len(combos),
         "train_n": train_n,
@@ -686,11 +797,18 @@ _WF_TEMPLATE = """<!DOCTYPE html>
     <h2>样本外测试期拼接净值（各折连乘）</h2>
     <div class="chart" id="curves"></div>
     <div class="note">只看<b>测试期</b>——训练期不参与画图。
-      若「全样本最优固定参数」明显高于三条自适应曲线，
+      若「全样本最优固定参数」明显高于自适应曲线，
       说明那组最优参数吃的是样本内的运气，实盘拿不到。<br/>
-      自适应里有三条：<b>argmax</b>（训练窗取最高分）、<b>邻域平滑</b>（取最高的那一片而非最高点）、
-      <b>全组合集成</b>（压根不选，所有候选等权持有）。
-      如果后两条稳定胜过 argmax，说明「选最高分」本身就是在踩噪声。</div>
+      自适应这一类里有三种做法：<b>argmax</b>（训练窗取最高分）、<b>邻域平滑</b>（取最高的那一片而非最高点）、
+      <b>参数集成</b>（压根不选，把候选的权重等权平均后一起持有；按平滑分只在<b>前 K 组</b>内平均）。
+      K 越小越靠近「选参」、K 越大越靠近「全买」——所以 K 必须以多条臂并列看，
+      不能事后再挑一个最好看的 K。</div>
+  </div>
+
+  <div class="group" id="kgroup" style="display:none">
+    <h2>集成度 K 的敏感度（在同一批测试窗上比较）</h2>
+    <div class="chart" id="kcurve"></div>
+    <div class="note" id="knote"></div>
   </div>
 
   <div class="group">
@@ -710,8 +828,9 @@ _WF_TEMPLATE = """<!DOCTYPE html>
   <div class="group">
     <h2>逐折明细</h2>
     <table id="folds"></table>
-    <div class="note">decay = 测试期夏普 − 训练期夏普。最后三列对比同一折里
-      三种选参方式的样本外收益——它们看的是<b>同一段测试窗</b>，差别只来自怎么选参数。
+    <div class="note">decay = 测试期夏普 − 训练期夏普。最后几列对比同一折里
+      不同选参 / 集成方式的样本外收益——它们看的是<b>同一段测试窗</b>，差别只来自怎么选参数。<br/>
+      <span id="ens-note" class="muted"></span>
       <span id="timing-note"></span></div>
   </div>
 </div>
@@ -722,7 +841,9 @@ const axisCommon = { axisLine:{lineStyle:{color:'#e6e6e6'}}, axisLabel:{color:'#
 // 卡片
 const cards = document.getElementById('cards');
 const pick = k => DATA.summary.find(s => s.key === k) || {total_return:0,annual_return:0,avg_sharpe:0,positive_folds:0,folds:0};
-const wf = pick('walk_forward'), sm = pick('smooth'), en = pick('ensemble');
+const wf = pick('walk_forward'), sm = pick('smooth');
+const ensRows = DATA.summary.filter(s => s.key.indexOf('ens') === 0);
+const en = ensRows.length ? ensRows.reduce((a,b) => b.total_return > a.total_return ? b : a) : sm;
 const fb = pick('full_sample_best'), df = pick('default');
 const card = (label, v, hint) => `<div class="card"><span>${label}</span><b>${v}</b>` +
   (hint ? `<span>${hint}</span>` : '') + '</div>';
@@ -731,8 +852,8 @@ cards.innerHTML =
        '年化 '+(wf.annual_return*100).toFixed(1)+'% · 平均夏普 '+wf.avg_sharpe.toFixed(2)) +
   card('邻域平滑选参', (sm.total_return*100).toFixed(1)+'%',
        '不选最高点、选最高的那一片 · 夏普 '+sm.avg_sharpe.toFixed(2)) +
-  card('全组合集成（不选）', (en.total_return*100).toFixed(1)+'%',
-       '所有候选等权持有 · 夏普 '+en.avg_sharpe.toFixed(2)) +
+  card('参数集成（并列多条 K，此为其一）', (en.total_return*100).toFixed(1)+'%',
+       en.label + ' · 夏普 '+en.avg_sharpe.toFixed(2)) +
   card('全样本最优（事后选参）', (fb.total_return*100).toFixed(1)+'%',
        DATA.full_best_label || '同期对照，高于前三条的部分是幻觉') +
   card('默认参数（不调参）', (df.total_return*100).toFixed(1)+'%',
@@ -740,35 +861,78 @@ cards.innerHTML =
 
 const gap = fb.total_return - wf.total_return;
 const better = Math.max(sm.total_return, en.total_return) - wf.total_return;
+const kmin = DATA.k_curve && DATA.k_curve.length
+  ? DATA.k_curve.reduce((a,b) => b.total_return < a.total_return ? b : a) : null;
 let verdict = gap > 0.05
   ? `<b>⚠️ 事后选参高估了 ${(gap*100).toFixed(1)} 个百分点</b>——全样本最优参数在样本外明显跑输自适应选参，说明调参过程在拟合噪声。`
   : `全样本最优与自适应选参差距 ${(gap*100).toFixed(1)} 个百分点，参数对样本外的影响有限。`;
 if (better > 0.005) {
-  verdict += `<br/><b>不踩尖峰更赚</b>：邻域平滑 / 全组合集成里最好的那条比 argmax 选参高出 ${(better*100).toFixed(1)} 个百分点——`
-           + `这直接说明「训练窗取最高分」挑到的大概率是噪声，而不是真实优势。`;
+  verdict += `<br/><b>不踩尖峰更赚</b>：邻域平滑 / 参数集成里最好的那条比 argmax 选参高出 ${(better*100).toFixed(1)} 个百分点——`
+           + `这直接说明「训练窗取最高分」挑到的大概率是噪声，而不是真实优势。`
+           + `（注意：集成族最好的那条往往是某个特定的 K，别把「最好的 K」当成结论，
+              那又是一次事后选择；K 的整体走势才是有信息的。）`;
 }
 document.getElementById('verdict').innerHTML = verdict + (DATA.ensemble_note ? '<br/>' + DATA.ensemble_note : '');
 
-// 净值曲线
+// 净值曲线（臂数随 --wf-ensemble-k 变化，这里按 summary 顺序动态渲染）
 const cv = echarts.init(document.getElementById('curves'));
-const ORDER = ['walk_forward','smooth','ensemble','full_sample_best','default'];
-const names = {walk_forward:'WF argmax 选参', smooth:'WF 邻域平滑',
-               ensemble:'全组合集成', full_sample_best:'全样本最优固定', default:'默认参数'};
-const colors = {walk_forward:'#cf1322', smooth:'#fa8c16', ensemble:'#2f6df0',
-                full_sample_best:'#8c8c8c', default:'#bfbfbf'};
-const widths  = {walk_forward:2.4, smooth:2.2, ensemble:2.6, full_sample_best:1.6, default:1.4};
+const ORDER = DATA.summary.map(s => s.key).filter(k => DATA.eq[k]);
+// 调色板：两条主线（argmax / 邻域平滑）最醒目，集成族用蓝色系渐深，复盘对照组用灰
+const FPAL = ['#cf1322','#fa8c16','#2f6df0','#5b8ff9','#69c0ff','#91caff','#8c8c8c','#bfbfbf'];
+const colors = {}, widths = {};
+ORDER.forEach((k, i) => {
+  colors[k] = (k === 'walk_forward') ? '#cf1322'
+            : (k === 'smooth') ? '#fa8c16'
+            : (k === 'full_sample_best') ? '#8c8c8c'
+            : (k === 'default') ? '#bfbfbf'
+            : (k.indexOf('ens') === 0 ? FPAL[2 + (i % 4)] : FPAL[i % FPAL.length]);
+  widths[k] = (k === 'walk_forward' || k === 'smooth') ? 2.4 : (k.indexOf('ens') === 0 ? 2.0 : 1.5);
+});
+const nameOf = k => { const r = DATA.summary.find(s => s.key === k); return r ? r.label : k; };
 cv.setOption({
   tooltip:{ trigger:'axis' },
-  legend:{ top:0, data:ORDER.map(k=>names[k]) },
+  legend:{ top:0, data:ORDER.map(nameOf) },
   grid:{ left:60, right:30, top:40, bottom:50 },
   xAxis:{ type:'category', data:DATA.eq_x, axisLabel:{ fontSize:10, color:'#6b7280' }, name:'交易日（仅测试窗）' },
   yAxis:{ type:'value', name:'净值', ...axisCommon },
-  series: ORDER.filter(k => DATA.eq[k]).map(k => ({
-    name:names[k], type:'line', showSymbol:false, smooth:true,
+  series: ORDER.map(k => ({
+    name:nameOf(k), type:'line', showSymbol:false, smooth:true,
     lineStyle:{ width:widths[k], color:colors[k] }, itemStyle:{ color:colors[k] },
     data: DATA.eq[k]
   }))
 });
+
+// 集成度 K 的敏感度
+let kc = null;
+if (DATA.k_curve && DATA.k_curve.length > 1) {
+  document.getElementById('kgroup').style.display = '';
+  kc = echarts.init(document.getElementById('kcurve'));
+  const kc_data = DATA.k_curve;
+  kc.setOption({
+    tooltip:{ trigger:'axis', axisPointer:{type:'shadow'},
+      formatter:function(ps){ const d = kc_data[ps[0].dataIndex];
+        return 'K='+d.k+'<br/>总收益 '+(d.total_return*100).toFixed(2)+'%<br/>夏普 '+d.avg_sharpe.toFixed(2)
+             + '<br/>最差折回撤 '+(d.worst_fold_drawdown*100).toFixed(2)+'%'; } },
+    legend:{ top:0, data:['样本外总收益','平均夏普','最差折回撤'] },
+    grid:{ left:70, right:70, top:40, bottom:40 },
+    xAxis:{ type:'category', data:kc_data.map(d=>'K='+d.k+' / '+DATA.n_combos),
+            axisLine:axisCommon.axisLine, axisLabel:axisCommon.axisLabel,
+            name:'集成组数 / 候选总数', nameLocation:'middle', nameGap:30 },
+    yAxis:[
+      { type:'value', name:'收益 / 回撤', axisLabel:{formatter:v=>(v*100).toFixed(0)+'%', color:'#6b7280'}, ...axisCommon },
+      { type:'value', name:'夏普', position:'right', axisLabel:{color:'#6b7280'}, ...axisCommon }
+    ],
+    series:[
+      { name:'样本外总收益', type:'bar', barMaxWidth:30, itemStyle:{ color:'#91caff' },
+        data: kc_data.map(d=>d.total_return) },
+      { name:'最差折回撤', type:'bar', barMaxWidth:30, itemStyle:{ color:'#ffccc7' },
+        data: kc_data.map(d=>d.worst_fold_drawdown) },
+      { name:'平均夏普', type:'line', yAxisIndex:1, symbolSize:9,
+        lineStyle:{width:2, color:'#cf1322'}, itemStyle:{ color:'#cf1322' },
+        data: kc_data.map(d=>d.avg_sharpe) }
+    ]
+  });
+}
 
 // 过拟合诊断
 const dc = echarts.init(document.getElementById('decay'));
@@ -793,7 +957,8 @@ const argmaxRet = (DATA.summary.find(s=>s.key==='walk_forward')||{total_return:0
 let sh = '<tr><th>参数策略</th><th>样本外总收益</th><th>vs argmax</th><th>年化</th><th>平均夏普</th><th>最差折回撤</th><th>正收益折占比</th><th>折数</th></tr>';
 DATA.summary.forEach(s => {
   const d = s.total_return - argmaxRet;
-  const extra = (s.key === 'smooth' || s.key === 'ensemble')
+  const isCand = (s.key === 'smooth' || s.key.indexOf('ens') === 0);
+  const extra = isCand
     ? `<td class="${d>=0?'pos':'neg'}">${d>=0?'+':''}${(d*100).toFixed(2)}%${cnote(d)}</td>` : '<td>—</td>';
   sh += `<tr><td>${s.label}</td>${pct(s.total_return)}${extra}${pct(s.annual_return)}
     <td>${s.avg_sharpe.toFixed(3)}</td>${pct(s.worst_fold_drawdown)}
@@ -801,10 +966,13 @@ DATA.summary.forEach(s => {
 });
 document.getElementById('summary').innerHTML = sh;
 
-// 逐折表
+// 逐折表（集成列随 K 变化）
+const ensKeys = DATA.summary.filter(s => s.key.indexOf('ens') === 0).map(s => s.key);
+const lblOf = k => { const r = DATA.summary.find(s => s.key === k); return r ? r.label.replace(/参数集成（/,'').replace(/）$/,'') : k; };
 let fh = '<tr><th>折</th><th>训练期</th><th>测试期</th><th>argmax 选中参数</th>' +
          '<th>训练夏普</th><th>测试夏普</th><th>衰减</th><th>测试收益</th><th>测试回撤</th>' +
-         '<th>邻域平滑选中</th><th>平滑收益</th><th>集成收益</th></tr>';
+         '<th>邻域平滑选中</th><th>平滑收益</th>' +
+         ensKeys.map(k => '<th>集成 '+lblOf(k)+'</th>').join('') + '</tr>';
 DATA.folds.forEach(f => {
   fh += `<tr><td>${f.fold}</td><td>${f.train_start}~${f.train_end}</td>
     <td>${f.test_start}~${f.test_end}</td>
@@ -812,12 +980,16 @@ DATA.folds.forEach(f => {
     <td>${f.train_sharpe.toFixed(2)}</td><td>${f.test_sharpe.toFixed(2)}</td>
     <td class="${f.decay>=0?'pos':'neg'}">${f.decay>=0?'+':''}${f.decay.toFixed(2)}</td>
     ${pct(f.test_return)}${pct(f.test_max_drawdown)}
-    <td>${f.smooth_chosen || '—'}</td>${pct(f.test_return_smooth)}${pct(f.test_return_ensemble)}</tr>`;
+    <td>${f.smooth_chosen || '—'}</td>${pct(f.test_return_smooth)}` +
+    ensKeys.map(k => pct(f['test_return_' + k])).join('') + '</tr>';
 });
 document.getElementById('folds').innerHTML = fh;
 document.getElementById('timing-note').textContent = DATA.timing_note || '';
+document.getElementById('knote').textContent = DATA.k_note || '';
+const _en = document.getElementById('ens-note');
+if (_en) _en.textContent = DATA.ens_note || '';
 
-window.addEventListener('resize', () => { cv.resize(); dc.resize(); });
+window.addEventListener('resize', () => { cv.resize(); dc.resize(); if (kc) kc.resize(); });
 </script></body></html>
 """
 
@@ -876,7 +1048,11 @@ def build_wf_report(res: dict, out_html: str, title: str = "样本外验证（Wa
         "eq_x": [f"第{i+1}折" for i in range(max_len)],
         "eq": eq,
         "timing_note": res.get("timing_note", ""),
+        "ens_note": res.get("ens_note", ""),
         "ensemble_note": res.get("ensemble_note", ""),
+        "k_curve": res.get("ensemble_k_curve", []),
+        "k_note": res.get("k_note", ""),
+        "n_combos": int(res.get("n_combos", 0)),
         "full_best_label": res.get("full_best_label", ""),
         "default_label": res.get("default_label", ""),
     }

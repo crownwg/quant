@@ -470,20 +470,28 @@ def test_walk_forward_rejects_too_short_windows():
 
 
 def test_walk_forward_runs_and_reports_all_arms():
-    """walk-forward 必须给出全部对照组：两条选参方式 + 不选参的集成 + 事后选参 + 不调参。
+    """walk-forward 必须给出全部对照组：两条选参方式 + 多个集成度 + 事后选参 + 不调参。
 
-    为什么是 5 条而不是最初 3 条：实测「训练窗取 argmax」挑到的多半是噪声
-    （滞回带 0 与 2% 各折各半），所以补了「邻域平滑」与「全组合集成」两条不做
+    为什么是这么多条而不是最初 3 条：实测「训练窗取 argmax」挑到的多半是噪声
+    （滞回带 0 与 2% 各折各半），所以补了「邻域平滑」与「参数集成」两条不做
     单点择优的对照——没有它们就分不清「参数有效」和「选择本身带来的虚假优势」。
+    集成又按 K（只在平滑分前 K 组内平均）展开成多条臂，是为了不把「K 取多少」
+    变成新一轮事后择优：K 本身也必须作为一维诚实地摆出来。
     """
     p = _prices(n_days=1500, n_codes=10, seed=11)
     args = _Args(use_open=False)
     res = grid.walk_forward_search(p, p, None, None, args, [60, 120], [3, 5], [0],
                                    pd.Timestamp(p.index[0]), train_years=2, test_years=0.5)
     assert len(res["folds"]) >= 2
-    assert list(res["summary"]["key"]) == [
-        "walk_forward", "smooth", "ensemble", "full_sample_best", "default"]
-    assert set(res["curves"]) == set(res["summary"]["key"])
+    keys = list(res["summary"]["key"])
+    assert keys[:2] == ["walk_forward", "smooth"]
+    assert keys[-2:] == ["full_sample_best", "default"]
+    ens = keys[2:-2]
+    assert ens, "至少要有一条集成臂"
+    # 集成臂名形如 ens3 / ens10 / ensall，且顺序与 K 列表一致
+    assert all(k.startswith("ens") for k in ens), ens
+    assert ens == grid.ensemble_arm_keys(grid.parse_ensemble_ks(None))
+    assert set(res["curves"]) == set(keys)
     # 每一折都必须给出训练期与测试期两套指标
     for _, r in res["folds"].iterrows():
         assert "train_sharpe" in r and "test_sharpe" in r

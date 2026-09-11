@@ -556,6 +556,10 @@ def make_parser() -> argparse.ArgumentParser:
                         "并与「全样本最优参数」「默认参数」对比，识别参数过拟合")
     p.add_argument("--fw-train", type=float, default=2.0, help="walk-forward 训练窗长度（年），默认 2")
     p.add_argument("--fw-test", type=float, default=0.5, help="walk-forward 测试窗长度（年），默认 0.5")
+    p.add_argument("--wf-ensemble-k", default="3,5,10,0",
+                   help="参数集成的集成度 K（逗号分隔），只在训练期平滑分前 K 组内等权平均；"
+                        "0 表示全部候选，1 退化为「按平滑分选参」。默认 3,5,10,0 —— "
+                        "多个 K 并列给出，是为了不把「K 取多少」变成新一轮事后择优")
     p.add_argument("--fw-metric", default="sharpe", choices=["sharpe", "calmar", "total_return"],
                    help="训练窗内选参依据，默认 sharpe")
 
@@ -827,12 +831,14 @@ def main() -> None:
         buffers = grid.parse_ints(args.grid_buffers)
         t_modes, t_lbs, t_bands, search_timing = _parse_timing_grid(args)
         proxy = _grid_timing_proxy(args, prices_all, fetch_start, search_timing)
+        ens_ks = grid.parse_ensemble_ks(args.wf_ensemble_k)
         start_ts = pd.Timestamp(args.start)
         ncomb = len(grid.build_combos(lookbacks, top_ns, buffers, t_modes, t_lbs, t_bands))
         print(f"\n【样本外验证】walk-forward · 训练 {args.fw_train} 年 / 测试 {args.fw_test} 年"
               f" · 网格 {len(lookbacks)}×{len(top_ns)}×{len(buffers)}"
               + (f" × 择时 {','.join(t_modes)}" if search_timing else "")
-              + f" = {ncomb} 组")
+              + f" = {ncomb} 组"
+              + f" · 集成 K={','.join('all' if k is None else str(k) for k in ens_ks)}")
         res = grid.walk_forward_search(
             prices_all, open_all, can_buy, can_sell, args,
             lookbacks, top_ns, buffers, start_ts,
@@ -840,7 +846,8 @@ def main() -> None:
             weight_cap=weight_cap_all, select_metric=args.fw_metric,
             exposure=exposure,
             timing_modes=t_modes, timing_lookbacks=t_lbs,
-            timing_bands=t_bands, proxy=proxy)
+            timing_bands=t_bands, proxy=proxy,
+            ensemble_ks=ens_ks)
         res["folds"].to_csv(f"{args.out_prefix}wf_folds.csv", index=False)
         res["summary"].to_csv(f"{args.out_prefix}wf_summary.csv", index=False)
         grid.build_wf_report(
@@ -854,19 +861,30 @@ def main() -> None:
         sm_ = res["summary"].set_index("key")
         base_ret = float(sm_.loc["walk_forward", "total_return"])
         for _, r in res["summary"].iterrows():
+            is_adaptive = str(r.get("key")) == "smooth" or str(r.get("key")).startswith("ens")
             delta = (f"  vs argmax {r['total_return'] - base_ret:>+7.1%}"
-                     if r.get("key") in ("smooth", "ensemble") else " " * 18)
+                     if is_adaptive else " " * 18)
             print(f"  {r['strategy']:<28s} 总收益 {r['total_return']:>7.1%}"
                   f" 年化 {r['annual_return']:>6.1%} 平均夏普 {r['avg_sharpe']:>5.2f}"
+                  f" 最差折回撤 {r['worst_fold_drawdown']:>7.1%}"
                   f" 正收益折 {r['positive_folds']:.0%}{delta}")
         gap = float(sm_.loc["full_sample_best", "total_return"]) - base_ret
         print(f"\n  事后选参 vs 自适应选参（argmax）差距：{gap:+.1%}"
               + ("（事后选参高估，说明参数在拟合噪声）" if gap > 0.02 else "（差距不大）"))
-        best_nosel = max(float(sm_.loc[k, "total_return"]) for k in ("smooth", "ensemble")
-                         if k in sm_.index)
+        # 不做单点择优的臂里最好的那条：平滑 + 各集成度一起比
+        no_sel_keys = [k for k in sm_.index if k == "smooth" or str(k).startswith("ens")]
+        best_nosel = max(float(sm_.loc[k, "total_return"]) for k in no_sel_keys)
         d_nosel = best_nosel - base_ret
-        print(f"  不踩尖峰（邻域平滑 / 全组合集成）最好的一条 vs argmax：{d_nosel:+.1%}"
+        print(f"  不踩尖峰（邻域平滑 / 参数集成）最好的一条 vs argmax：{d_nosel:+.1%}"
               + ("（正则说明 argmax 挑到的主要是噪声）" if d_nosel > 0.005 else "（选参方式差别不大）"))
+        if res.get("k_note"):
+            print(f"  集成度 K：{res['k_note']}")
+            print("  ——K 的收益随 K 单调下降/上升才是信息（说明参数曲面有真实的上下结构）；"
+                  "忽高忽低说明排序本身就是噪声。无论哪种，都不要事后挑最好看的 K。")
+        if res.get("ens_note"):
+            print(f"  {res['ens_note']}")
+            print("  ——若最窄集成臂每折持有的模式高度一致（都是 ma 或都是 off），"
+                  "那是结构结论；若每折都不一样，说明宽集成只是被动分散。")
         if res.get("timing_note"):
             print(f"  {res['timing_note']}")
             print("  ——频繁选中 off 说明择时参数没有稳定信息；频繁选中某个模式"
