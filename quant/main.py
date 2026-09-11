@@ -195,8 +195,8 @@ def _norm_index_symbol(sym: str) -> str:
     return timing.norm_index_symbol(sym)
 
 
-def resolve_exposure(args, prices_all: pd.DataFrame, fetch_start: str):
-    """构造择时敞口序列（0~1），未启用择时时返回 None。
+def _resolve_proxy(args, prices_all: pd.DataFrame, fetch_start: str):
+    """解析择时代理序列，返回 (proxy, label)；proxy 为 None 表示改用池子等权组合。
 
     --timing-proxy 决定拿什么当「市场」：
       benchmark : --benchmark 指定的指数
@@ -204,13 +204,12 @@ def resolve_exposure(args, prices_all: pd.DataFrame, fetch_start: str):
       auto      : 有 --benchmark 就用基准，否则用池子等权组合
       其他任意值 : 当作指数代码，如 000932（中证消费）→ 自动补前缀
 
-    选基准还是池子，取决于你想对冲的是「市场 beta」还是「这个行业的 beta」。
-    交易消费池时，用中证消费指数（sh000932）通常比沪深300更贴切。
+    结果缓存在 args._proxy_cache：网格/样本外要按几十组参数分别构造敞口，
+    若每次都重新联网取指数，启动时间会拖到不可用。
     """
-    timing_on = (getattr(args, "timing", "off") or "off") != "off"
-    vol_on = float(getattr(args, "vol_target", 0.0) or 0.0) > 0
-    if not timing_on and not vol_on:
-        return None
+    cached = getattr(args, "_proxy_cache", None)
+    if cached is not None:
+        return cached
 
     spec = (getattr(args, "timing_proxy", "auto") or "auto").strip()
     sym = ""
@@ -230,9 +229,55 @@ def resolve_exposure(args, prices_all: pd.DataFrame, fetch_start: str):
         except Exception as exc:  # noqa: BLE001
             print(f"⚠️ 择时代理指数 {sym} 获取失败，回退到池子等权组合: {exc}")
             proxy = None
+    args._proxy_cache = (proxy, label)
+    return proxy, label
 
+
+def resolve_exposure(args, prices_all: pd.DataFrame, fetch_start: str):
+    """构造择时敞口序列（0~1），未启用择时时返回 None。
+
+    选基准还是池子，取决于你想对冲的是「市场 beta」还是「这个行业的 beta」。
+    交易消费池时，用中证消费指数（sh000932）通常比沪深300更贴切。
+    """
+    timing_on = (getattr(args, "timing", "off") or "off") != "off"
+    vol_on = float(getattr(args, "vol_target", 0.0) or 0.0) > 0
+    if not timing_on and not vol_on:
+        return None
+
+    proxy, label = _resolve_proxy(args, prices_all, fetch_start)
     return timing.build_exposure(args, proxy=proxy, prices=prices_all,
                                  proxy_label=label, verbose=True)
+
+
+def _parse_timing_grid(args):
+    """解析 --grid-timing / --grid-timing-lookbacks / --grid-timing-bands。
+
+    返回 (modes, lookbacks, bands, search_timing)。search_timing=False 时网格只扫
+    选股参数，各组合沿用 --timing 那一条敞口（旧行为，保持兼容）。
+    模式列表里自动补上 off：不带上「不择时」这个对照组，搜索就永远得不出
+    「不如不择时」的结论。
+    """
+    raw = str(getattr(args, "grid_timing", "") or "")
+    modes = [m.strip().lower() for m in raw.split(",") if m.strip()]
+    bad = [m for m in modes if m not in timing.TIMING_MODES]
+    if bad:
+        raise SystemExit(f"--grid-timing 含未知模式 {bad}，可选 {list(timing.TIMING_MODES)}")
+    if not modes:
+        return [], [], [], False
+    lbs = grid.parse_ints(str(getattr(args, "grid_timing_lookbacks", "60,120") or "60,120"))
+    bands = grid.parse_floats(str(getattr(args, "grid_timing_bands", "0") or "0"))
+    if "off" not in modes:
+        modes.insert(0, "off")
+    return modes, lbs, bands, True
+
+
+def _grid_timing_proxy(args, prices_all, fetch_start, search_timing: bool):
+    """网格/样本外扫择时时需要一条「整段」代理序列；不扫则返回 None（连指数都不去取）。"""
+    if not search_timing:
+        return None
+    proxy, label = _resolve_proxy(args, prices_all, fetch_start)
+    print(f"  择时代理    : {label}")
+    return proxy
 
 
 def _build_today_plan(plan: pd.DataFrame, prices: pd.DataFrame,
@@ -485,6 +530,14 @@ def make_parser() -> argparse.ArgumentParser:
                    help="网格 top_n 候选，逗号分隔，默认 10,15,20")
     p.add_argument("--grid-buffers", default="0,2",
                    help="网格 buffer 候选，逗号分隔，默认 0,2")
+    p.add_argument("--grid-timing", default="",
+                   help="把择时模式也纳入网格/样本外搜索，逗号分隔，如 off,ma,momentum。"
+                        "留空=不扫择时（沿用 --timing 那一条）。"
+                        "会自动补上 off（不择时），否则无法回答「择时到底该不该用」")
+    p.add_argument("--grid-timing-lookbacks", default="60,120",
+                   help="择时窗口候选，逗号分隔，默认 60,120（仅对 --grid-timing 里非 off 的模式生效）")
+    p.add_argument("--grid-timing-bands", default="0,0.02",
+                   help="择时滞回带候选，逗号分隔，默认 0,0.02")
 
     # 因子有效性检验
     p.add_argument("--factor-eval", action="store_true",
@@ -553,9 +606,17 @@ def main() -> None:
     # 预热期：因子需要历史数据才能计算，往前多取一段，否则开头几个月空仓。
     # 择时的滚动窗口（均线 / 已实现波动率）同样需要预热，否则回测开头会被迫空仓。
     factor_warm = max(args.lookback, args.ma_long, args.vol_lookback, args.vol_long)
-    timing_warm = max(int(getattr(args, "timing_lookback", 0) or 0),
-                      int(getattr(args, "vol_target_lookback", 0) or 0),
-                      int(getattr(args, "timing_smooth", 0) or 0))
+    # 网格/样本外若同时扫择时窗口，预热期必须覆盖候选里最长的那个窗口，
+    # 否则那些「长窗口」组合在开头会因为均线历史不足而被迫空仓，被误判成更差。
+    grid_tlbs: list[int] = []
+    if str(getattr(args, "grid_timing", "") or "").strip():
+        try:
+            grid_tlbs = grid.parse_ints(str(getattr(args, "grid_timing_lookbacks", "") or "0"))
+        except ValueError:
+            grid_tlbs = []
+    timing_warm = max([int(getattr(args, "timing_lookback", 0) or 0),
+                       int(getattr(args, "vol_target_lookback", 0) or 0),
+                       int(getattr(args, "timing_smooth", 0) or 0)] + grid_tlbs)
     warm_days = max(factor_warm, timing_warm) * 2 + 30
     # 次新股过滤按「上市自然日」判断，面板必须比回测起点再往前 min_listed_days，
     # 否则老股票的可用历史会被误判成"刚上市"而被整体剔除。
@@ -711,30 +772,51 @@ def main() -> None:
         lookbacks = grid.parse_ints(args.grid_lookbacks)
         top_ns = grid.parse_ints(args.grid_topn)
         buffers = grid.parse_ints(args.grid_buffers)
+        t_modes, t_lbs, t_bands, search_timing = _parse_timing_grid(args)
+        proxy = _grid_timing_proxy(args, prices_all, fetch_start, search_timing)
         bench = None
         if args.benchmark:
             try:
                 bench = load_index(args.benchmark, args.start, args.end)
             except Exception as exc:  # noqa: BLE001
                 print(f"⚠️ 基准获取失败，网格不计算超额: {exc}")
-        ncomb = len(lookbacks) * len(top_ns) * len(buffers)
-        print(f"\n【参数优化】网格 {len(lookbacks)}×{len(top_ns)}×{len(buffers)} = {ncomb} 组，池子 {len(codes)} 只")
+        nbase = len(lookbacks) * len(top_ns) * len(buffers)
+        ncomb = len(grid.build_combos(lookbacks, top_ns, buffers, t_modes, t_lbs, t_bands))
+        tdesc = (f" × 择时 {','.join(t_modes)}×窗口{len(t_lbs)}×带{len(t_bands)}"
+                 if search_timing else "")
+        print(f"\n【参数优化】网格 {len(lookbacks)}×{len(top_ns)}×{len(buffers)} = {nbase} 组"
+              f"{tdesc} → 合计 {ncomb} 组，池子 {len(codes)} 只")
         start_ts = pd.Timestamp(args.start)
         res = grid.grid_search(prices_all, open_all, can_buy, can_sell, args,
                                lookbacks, top_ns, buffers, start_ts, benchmark_curve=bench,
-                               weight_cap=weight_cap_all, exposure=exposure)
+                               weight_cap=weight_cap_all, exposure=exposure,
+                               timing_modes=t_modes, timing_lookbacks=t_lbs,
+                               timing_bands=t_bands, proxy=proxy)
         res.to_csv(f"{args.out_prefix}grid_results.csv", index=False)
         sub = (f"池子 {len(codes)}只 · 区间 {args.start}~{args.end} · "
-               f"网格 {len(lookbacks)}×{len(top_ns)}×{len(buffers)} · 基准 {args.benchmark or '无'}")
+               f"网格 {len(lookbacks)}×{len(top_ns)}×{len(buffers)}"
+               + (f" × 择时({','.join(t_modes)})" if search_timing else "")
+               + f" = {ncomb} 组 · 基准 {args.benchmark or '无'}")
         grid.build_grid_report(res, f"{args.out_prefix}grid_report.html",
                                title="参数优化网格搜索", subtitle=sub)
         print("\n【Top 按夏普】")
         for _, r in res.sort_values("sharpe", ascending=False).head(10).iterrows():
             er = f" 超额 {r['excess_return']:.1%} IR {r['information_ratio']:.2f}" if "excess_return" in r else ""
-            print(f"  lb={int(r['lookback'])} n={int(r['top_n'])} buf={int(r['buffer'])}"
-                  f" | 收益 {r['total_return']:.1%} 夏普 {r['sharpe']:.2f}"
+            lbl = grid.combo_label({"lookback": int(r["lookback"]), "top_n": int(r["top_n"]),
+                                    "buffer": int(r["buffer"]),
+                                    "timing": r.get("timing", "off"),
+                                    "timing_lookback": r.get("timing_lookback", 0),
+                                    "timing_band": r.get("timing_band", 0.0)})
+            print(f"  {lbl:<34s} | 收益 {r['total_return']:.1%} 夏普 {r['sharpe']:.2f}"
                   f" 回撤 {r['max_drawdown']:.1%} 最差年 {r['worst_year_return']:.1%}"
                   f" 正年 {r['positive_year_ratio']:.0%}{er}")
+        if search_timing and "timing" in res.columns:
+            print("\n【按择时模式分组（组内平均）】")
+            for tm, sres in res.groupby("timing", sort=False):
+                print(f"  {str(tm):<9s} n={len(sres):<3d} 平均收益 {sres['total_return'].mean():>7.1%}"
+                      f" 平均夏普 {sres['sharpe'].mean():>5.2f}"
+                      f" 平均回撤 {sres['max_drawdown'].mean():>7.1%}")
+            print("  ——若 off 组的平均夏普最高，说明这一轮里择时参数整体在减分")
         print(f"\n网格结果已保存: {args.out_prefix}grid_results.csv / {args.out_prefix}grid_report.html")
         return
 
@@ -743,15 +825,22 @@ def main() -> None:
         lookbacks = grid.parse_ints(args.grid_lookbacks)
         top_ns = grid.parse_ints(args.grid_topn)
         buffers = grid.parse_ints(args.grid_buffers)
+        t_modes, t_lbs, t_bands, search_timing = _parse_timing_grid(args)
+        proxy = _grid_timing_proxy(args, prices_all, fetch_start, search_timing)
         start_ts = pd.Timestamp(args.start)
+        ncomb = len(grid.build_combos(lookbacks, top_ns, buffers, t_modes, t_lbs, t_bands))
         print(f"\n【样本外验证】walk-forward · 训练 {args.fw_train} 年 / 测试 {args.fw_test} 年"
-              f" · 网格 {len(lookbacks)}×{len(top_ns)}×{len(buffers)}")
+              f" · 网格 {len(lookbacks)}×{len(top_ns)}×{len(buffers)}"
+              + (f" × 择时 {','.join(t_modes)}" if search_timing else "")
+              + f" = {ncomb} 组")
         res = grid.walk_forward_search(
             prices_all, open_all, can_buy, can_sell, args,
             lookbacks, top_ns, buffers, start_ts,
             train_years=args.fw_train, test_years=args.fw_test,
             weight_cap=weight_cap_all, select_metric=args.fw_metric,
-            exposure=exposure)
+            exposure=exposure,
+            timing_modes=t_modes, timing_lookbacks=t_lbs,
+            timing_bands=t_bands, proxy=proxy)
         res["folds"].to_csv(f"{args.out_prefix}wf_folds.csv", index=False)
         res["summary"].to_csv(f"{args.out_prefix}wf_summary.csv", index=False)
         grid.build_wf_report(
@@ -759,8 +848,8 @@ def main() -> None:
             title="样本外验证（Walk-Forward）",
             subtitle=(f"池子 {len(codes)}只 · 区间 {args.start}~{args.end} · "
                       f"训练 {res['train_n']}日/测试 {res['test_n']}日 · "
-                      f"全样本最优 lb={res['full_best_combo'][0]} n={res['full_best_combo'][1]} "
-                      f"buf={res['full_best_combo'][2]}"))
+                      f"搜索空间 {res['n_combos']} 组 · "
+                      f"全样本最优 {res['full_best_label']}"))
         print("\n【样本外表现对比】")
         for _, r in res["summary"].iterrows():
             print(f"  {r['strategy']:<26s} 总收益 {r['total_return']:>7.1%}"
@@ -769,6 +858,10 @@ def main() -> None:
         gap = (res["summary"].iloc[1]["total_return"] - res["summary"].iloc[0]["total_return"])
         print(f"\n  事后选参 vs 自适应选参 差距：{gap:+.1%}"
               + ("（事后选参高估，说明参数在拟合噪声）" if gap > 0.02 else "（差距不大）"))
+        if res.get("timing_note"):
+            print(f"  {res['timing_note']}")
+            print("  ——频繁选中 off 说明择时参数没有稳定信息；频繁选中某个模式"
+                  "才是「均线确实能识别下跌」的证据")
         print(f"\n样本外验证结果已保存: {args.out_prefix}wf_folds.csv"
               f" / {args.out_prefix}wf_summary.csv / {args.out_prefix}wf_report.html")
         return

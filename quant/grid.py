@@ -29,7 +29,7 @@ import pandas as pd
 
 from .backtest import run, cost_kwargs
 from .strategy import factor_weights, weights_from_args
-from . import factors, rolling
+from . import factors, rolling, timing
 
 
 def parse_ints(text: str) -> list[int]:
@@ -37,26 +37,169 @@ def parse_ints(text: str) -> list[int]:
     return [int(x.strip()) for x in text.split(",") if x.strip()]
 
 
+def parse_floats(text: str) -> list[float]:
+    """把 '0,0.02,0.05' 解析成 [0.0, 0.02, 0.05]。"""
+    return [float(x.strip()) for x in text.split(",") if x.strip()]
+
+
+# ============================================================ 参数组合
+#
+# 为什么 combo 是 dict 而不是 tuple
+# --------------------------------
+# 原来 combo = (lookback, top_n, buffer)。加入择时后维度变成 6 个，tuple 的
+# 下标访问（combo[0]/[1]/[2]）在每处都要重新数一遍，稍不留神就串位。改成 dict
+# 后新增维度不需要改动任何读写点，报告里也能直接按 key 渲染。
+#
+# 为什么「off 组合不展开 timing_lookback × timing_band」
+# ----------------------------------------------------
+# 不择时时窗口取 120 还是 200 完全等价，若跟着展开，同一个策略会在网格里
+# 重复出现 N 次、把「平均夏普」这类统计搅浑（等价样本被当成独立样本加权）。
+# 所以 off 只保留一份。
+
+def build_combos(lookbacks: list[int], top_ns: list[int], buffers: list[int],
+                 timing_modes: list[str] | None = None,
+                 timing_lookbacks: list[int] | None = None,
+                 timing_bands: list[float] | None = None) -> list[dict]:
+    """构造参数组合列表（每个组合是 dict）。
+
+    timing_modes 为空 → 只有一组 timing="off"，各组合沿用调用方给定的整体敞口
+    （即旧的 `--timing ma --grid ...` 行为，网格只扫选股参数）。
+    timing_modes 非空 → **强制包含 "off"**：搜索空间里必须有「不择时」这个选项，
+    否则 walk-forward 无法回答「择时到底该不该用」——它只会在给定的几组择时参数
+    里挑一个，永远得不出「不如不择时」的结论。
+    """
+    modes = [str(m).strip().lower() for m in (timing_modes or []) if str(m).strip()]
+    search_timing = bool(modes)
+    if search_timing and "off" not in modes:
+        modes.insert(0, "off")
+    if not modes:
+        modes = ["off"]
+
+    tlbs = [int(x) for x in (timing_lookbacks or [120])] or [120]
+    tbs = [float(x) for x in (timing_bands or [0.0])] or [0.0]
+
+    combos: list[dict] = []
+    for tm in modes:
+        variants = ([{}] if tm == "off"
+                    else [{"timing_lookback": lb, "timing_band": b}
+                          for lb in tlbs for b in tbs])
+        for v in variants:
+            for lb, tn, buf in itertools.product(lookbacks, top_ns, buffers):
+                combo = {"lookback": int(lb), "top_n": int(tn), "buffer": int(buf),
+                         "timing": tm,
+                         "timing_lookback": int(v.get("timing_lookback", 0)),
+                         "timing_band": float(v.get("timing_band", 0.0))}
+                combos.append(combo)
+    return combos
+
+
+def combo_label(combo: dict) -> str:
+    """把参数组合渲染成一行可读标签，报告与日志共用（避免两处格式漂移）。"""
+    base = f"lb={combo.get('lookback')} n={combo.get('top_n')} buf={combo.get('buffer')}"
+    tm = (combo.get("timing") or "off").strip().lower()
+    if tm in ("", "off", "none"):
+        return f"{base} · 不择时"
+    lb = combo.get("timing_lookback") or 0
+    band = float(combo.get("timing_band") or 0.0)
+    return f"{base} · {tm}({lb}日,带{band:.1%})"
+
+
+def _timing_cfg(combo: dict, args) -> dict:
+    """把 combo 的择时维度 + args 里其余择时旋钮合成一份 cfg（timing.build_exposure 吃 dict）。"""
+    return {
+        "timing": combo.get("timing") or "off",
+        "timing_lookback": int(combo.get("timing_lookback") or getattr(args, "timing_lookback", 120)),
+        "timing_band": float(combo.get("timing_band") or getattr(args, "timing_band", 0.0) or 0.0),
+        "timing_ma_slope": int(getattr(args, "timing_ma_slope", 0) or 0),
+        "timing_min_exposure": float(getattr(args, "timing_min_exposure", 0.0) or 0.0),
+        "timing_max_exposure": float(getattr(args, "timing_max_exposure", 1.0) or 1.0),
+        "timing_smooth": int(getattr(args, "timing_smooth", 0) or 0),
+        "vol_target": float(getattr(args, "vol_target", 0.0) or 0.0),
+        "vol_target_lookback": int(getattr(args, "vol_target_lookback", 60) or 60),
+        "vol_floor": float(getattr(args, "vol_floor", 0.2) or 0.0),
+        "vol_cap": float(getattr(args, "vol_cap", 1.0) or 1.0),
+    }
+
+
+def _slice_series(series: pd.Series | None, end_pos: int | None) -> pd.Series | None:
+    """把敞口序列截到 end_pos（不含），保证「只用 < end_pos 的信息」。"""
+    if series is None:
+        return None
+    return series.iloc[:end_pos] if end_pos is not None else series
+
+
+def _exposure_getter(proxy: pd.Series | None, prices_all: pd.DataFrame, args,
+                     fallback: pd.Series | None = None,
+                     search_timing: bool = False):
+    """返回 `get(combo, end_pos) -> 敞口序列 | None`。
+
+    约定
+    ----
+    - search_timing=False：不扫择时维度，直接沿用调用方给的 fallback 敞口
+      （即 `--timing ma --grid ...` 这种「择时定死、只扫选股参数」的旧路径）。
+    - search_timing=True ：按 combo 里的 (timing, 窗口, 带) 构造敞口，
+      同一组参数只算一次（训练窗选参与测试窗验证共用），之后只做切片。
+
+    为什么可以「整条算完再切片」而不是「截断后再算」
+    ----------------------------------------------
+    本模块所有择时函数都只依赖 close[t] 及更早（见 timing.py 的因果性说明），
+    整条序列在 t 处的取值与「只用前 t 个点重算」完全一致；带上滞回状态机也一样，
+    记忆只沿时间正向流动。反过来，若每次都截断重算，状态机会在每个窗口开头
+    重置为空仓，训练/测试两窗的口径反而对不上。
+    """
+    cache: dict[tuple, pd.Series | None] = {}
+
+    def get(combo: dict, end_pos: int | None):
+        tm = (combo.get("timing") or "off").strip().lower()
+        if not search_timing:
+            return _slice_series(fallback, end_pos)
+        key = (tm, int(combo.get("timing_lookback") or 0), float(combo.get("timing_band") or 0.0))
+        if key not in cache:
+            cfg = _timing_cfg(combo, args)
+            cache[key] = timing.build_exposure(
+                cfg, proxy=proxy, prices=prices_all, verbose=False)
+        return _slice_series(cache[key], end_pos)
+
+    return get
+
+
 def grid_search(prices_all: pd.DataFrame, open_all: pd.DataFrame,
                 can_buy, can_sell, args,
                 lookbacks: list[int], top_ns: list[int], buffers: list[int],
                 start_ts: pd.Timestamp, benchmark_curve: pd.Series | None = None,
                 weight_cap: pd.DataFrame | None = None,
-                exposure: pd.Series | None = None) -> pd.DataFrame:
+                exposure: pd.Series | None = None,
+                timing_modes: list[str] | None = None,
+                timing_lookbacks: list[int] | None = None,
+                timing_bands: list[float] | None = None,
+                proxy: pd.Series | None = None) -> pd.DataFrame:
     """对每组合回测，返回结果 DataFrame（一行一组合）。
+
+    两种模式
+    --------
+    - 只扫选股参数（timing_modes 为空）：所有组合沿用 exposure（`--timing ma` 那条）。
+    - 同时扫择时参数（timing_modes 非空，如 ["off","ma","momentum"]）：每个组合
+      按自己的择时配置构造敞口，网格里会出现「不择时」的对照组。
 
     ⚠️ 这是**全样本网格搜索**：在整段样本上挑最优参数，等于「事后选参」，
     结果天然偏乐观。要判断参数是否真的稳健，请用 walk_forward_search。
     """
     rows = []
-    combos = list(itertools.product(lookbacks, top_ns, buffers))
+    combos = build_combos(lookbacks, top_ns, buffers,
+                          timing_modes, timing_lookbacks, timing_bands)
     total = len(combos)
     cost = cost_kwargs(args)
-    for i, (lb, tn, buf) in enumerate(combos, 1):
-        score = factors.momentum(prices_all, lb, args.skip_recent)
+    get_exposure = _exposure_getter(proxy, prices_all, args, fallback=exposure,
+                                   search_timing=bool(timing_modes))
+    score_cache = {lb: factors.momentum(prices_all, lb, args.skip_recent)
+                   for lb in dict.fromkeys(c["lookback"] for c in combos)}
+    for i, combo in enumerate(combos, 1):
+        lb, tn, buf = combo["lookback"], combo["top_n"], combo["buffer"]
+        score = score_cache[lb]
         weights_all = weights_from_args(score, args, can_buy=can_buy, can_sell=can_sell,
                                         prices=prices_all, weight_cap=weight_cap,
-                                        exposure=exposure, top_n=tn, buffer=buf)
+                                        exposure=get_exposure(combo, None),
+                                        top_n=tn, buffer=buf)
         keep = weights_all.index >= start_ts
         prices = prices_all.loc[keep]
         weights = weights_all.loc[keep]
@@ -68,6 +211,8 @@ def grid_search(prices_all: pd.DataFrame, open_all: pd.DataFrame,
 
         rec = {
             "lookback": lb, "top_n": tn, "buffer": buf,
+            "timing": combo["timing"], "timing_lookback": combo["timing_lookback"],
+            "timing_band": combo["timing_band"],
             "total_return": m["total_return"], "annual_return": m["annual_return"],
             "sharpe": m["sharpe"], "max_drawdown": m["max_drawdown"],
             "calmar": m["calmar"], "annual_turnover": m["annual_turnover"],
@@ -83,7 +228,7 @@ def grid_search(prices_all: pd.DataFrame, open_all: pd.DataFrame,
                 rec["information_ratio"] = (float(ex_daily.mean() / ex_daily.std() * (252 ** 0.5))
                                            if ex_daily.std() else 0.0)
         rows.append(rec)
-        print(f"  [{i}/{total}] lb={lb} n={tn} buf={buf} | 收益 {m['total_return']:.1%}"
+        print(f"  [{i}/{total}] {combo_label(combo)} | 收益 {m['total_return']:.1%}"
               f" 夏普 {m['sharpe']:.2f} 回撤 {m['max_drawdown']:.1%} 最差年 {worst_year:.1%}", flush=True)
     return pd.DataFrame(rows)
 
@@ -142,6 +287,10 @@ def walk_forward_search(prices_all: pd.DataFrame, open_all: pd.DataFrame,
                         test_years: float = 0.5, weight_cap: pd.DataFrame | None = None,
                         select_metric: str = "sharpe",
                         exposure: pd.Series | None = None,
+                        timing_modes: list[str] | None = None,
+                        timing_lookbacks: list[int] | None = None,
+                        timing_bands: list[float] | None = None,
+                        proxy: pd.Series | None = None,
                         periods_per_year: int = 252) -> dict:
     """滚动训练/测试的样本外验证。
 
@@ -150,6 +299,12 @@ def walk_forward_search(prices_all: pd.DataFrame, open_all: pd.DataFrame,
       curves     {'walk_forward'|'full_sample_best'|'default': 测试期拼接净值}
       summary    三者的汇总指标 DataFrame
       chosen     每折选中的参数
+      timing_note 各折选中的择时模式统计（搜索空间含 off 时才有意义）
+
+    特别提醒：若 timing_modes 非空，搜索空间里会强制包含「不择时」。
+    这样「择时参数是不是拟合出来的」才有答案——如果各折频繁选中 ma，
+    说明该池子的下跌段确实能被均线识别；如果频繁选中 off，
+    说明之前那组「三项全改善」的择时参数只是在全样本上凑出来的。
     """
     idx_all = prices_all.index
     n_all = len(idx_all)
@@ -165,32 +320,45 @@ def walk_forward_search(prices_all: pd.DataFrame, open_all: pd.DataFrame,
             f"样本不足以做 walk-forward：区间内仅 {len(folds)} 折。"
             f"请拉长 --start/--end，或缩小 --fw-train / --fw-test")
 
-    combos = list(itertools.product(lookbacks, top_ns, buffers))
+    search_timing = bool(timing_modes)
+    combos = build_combos(lookbacks, top_ns, buffers,
+                          timing_modes, timing_lookbacks, timing_bands)
     score_cache = {lb: factors.momentum(prices_all, lb, getattr(args, "skip_recent", 0))
-                   for lb in lookbacks}
+                   for lb in dict.fromkeys(c["lookback"] for c in combos)}
+    get_exposure = _exposure_getter(proxy, prices_all, args, fallback=exposure,
+                                   search_timing=search_timing)
     cost = cost_kwargs(args)
 
     def run_combo(combo, end_pos, lo, hi):
-        """在 [lo, hi) 上跑 combo，权重只用 < hi 的数据计算（无前视）。"""
-        lb, tn, buf = combo
-        sc = score_cache[lb].iloc[:end_pos]
+        """在 [lo, hi) 上跑 combo，权重只用 < hi 的数据计算（无前视）。
+
+        end_pos 是「权重允许看到的数据边界」，恒等于本折测试窗的终点；
+        训练窗与测试窗都用它，因此两窗的选股/择时口径完全一致，
+        差别只在回测区间 [lo, hi)。
+        """
+        sc = score_cache[combo["lookback"]].iloc[:end_pos]
         w = weights_from_args(
             sc, args,
             can_buy=(can_buy.iloc[:end_pos] if can_buy is not None else None),
             can_sell=(can_sell.iloc[:end_pos] if can_sell is not None else None),
             prices=prices_all.iloc[:end_pos],
             weight_cap=(weight_cap.iloc[:end_pos] if weight_cap is not None else None),
-            exposure=(exposure.iloc[:end_pos] if exposure is not None else None),
-            top_n=tn, buffer=buf)
+            exposure=get_exposure(combo, end_pos),
+            top_n=combo["top_n"], buffer=combo["buffer"])
         w = w.iloc[lo:hi]
         p = prices_all.iloc[lo:hi]
         o = open_all.iloc[lo:hi] if getattr(args, "use_open", False) else None
         eq, m, _ = run(p, w, open_prices=o, **cost)
         return eq, m
 
-    default_combo = (int(getattr(args, "lookback", 120)),
-                     int(getattr(args, "top_n", 10)),
-                     int(getattr(args, "buffer", 0)))
+    default_combo = {
+        "lookback": int(getattr(args, "lookback", 120)),
+        "top_n": int(getattr(args, "top_n", 10)),
+        "buffer": int(getattr(args, "buffer", 0)),
+        "timing": (getattr(args, "timing", "off") or "off"),
+        "timing_lookback": int(getattr(args, "timing_lookback", 120) or 0),
+        "timing_band": float(getattr(args, "timing_band", 0.0) or 0.0),
+    }
 
     # ---- 对照组 A：全样本事后选参 ----
     print(f"  [对照组] 全样本网格 {len(combos)} 组，用于对比「事后选参」的幻觉")
@@ -201,7 +369,7 @@ def walk_forward_search(prices_all: pd.DataFrame, open_all: pd.DataFrame,
                           "total_return": m["total_return"], "sharpe": m["sharpe"],
                           "max_drawdown": m["max_drawdown"]})
     full_df = pd.DataFrame(full_rows)
-    full_best_combo = tuple(full_df.sort_values(select_metric, ascending=False)["combo"].iloc[0])
+    full_best_combo = full_df.sort_values(select_metric, ascending=False)["combo"].iloc[0]
 
     # ---- 逐折：训练窗选参 → 测试窗纯验证 ----
     print(f"\n【Walk-Forward】{len(folds)} 折，训练 {train_n} 日 / 测试 {test_n} 日"
@@ -229,7 +397,12 @@ def walk_forward_search(prices_all: pd.DataFrame, open_all: pd.DataFrame,
             "fold": fi,
             "train_start": idx_all[s].date(), "train_end": idx_all[se - 1].date(),
             "test_start": idx_all[se].date(), "test_end": idx_all[te - 1].date(),
-            "lookback": wf_combo[0], "top_n": wf_combo[1], "buffer": wf_combo[2],
+            "lookback": wf_combo["lookback"], "top_n": wf_combo["top_n"],
+            "buffer": wf_combo["buffer"],
+            "timing": wf_combo.get("timing", "off"),
+            "timing_lookback": wf_combo.get("timing_lookback", 0),
+            "timing_band": wf_combo.get("timing_band", 0.0),
+            "chosen": combo_label(wf_combo),
             "train_sharpe": round(float(wf_train_m["sharpe"]), 3),
             "train_return": round(float(wf_train_m["total_return"]), 4),
             "test_sharpe": round(float(m_wf["sharpe"]), 3),
@@ -238,12 +411,19 @@ def walk_forward_search(prices_all: pd.DataFrame, open_all: pd.DataFrame,
             "decay": round(float(m_wf["sharpe"] - wf_train_m["sharpe"]), 3),
         })
         print(f"  第{fi}折 {idx_all[s].date()}~{idx_all[se-1].date()} 选参"
-              f" lb={wf_combo[0]} n={wf_combo[1]} buf={wf_combo[2]}"
+              f" {combo_label(wf_combo)}"
               f" | 样本内夏普 {wf_train_m['sharpe']:.2f} → 样本外 {m_wf['sharpe']:.2f}"
               f"（衰减 {fold_rows[-1]['decay']:+.2f}）"
               f" | 样本外收益 {m_wf['total_return']:.1%}", flush=True)
 
     folds_df = pd.DataFrame(fold_rows)
+
+    # ---- 择时模式在样本外被选中的频次（回答「该不该用择时」）----
+    timing_note = ""
+    if search_timing and len(folds_df):
+        counts = folds_df["timing"].value_counts()
+        timing_note = "各折选中的择时模式：" + "、".join(
+            f"{k} × {v}" for k, v in counts.items())
 
     # ---- 拼接测试期净值（按各段收益连乘）----
     def chain(records):
@@ -284,6 +464,11 @@ def walk_forward_search(prices_all: pd.DataFrame, open_all: pd.DataFrame,
         "curves": curves,
         "full_best_combo": full_best_combo,
         "default_combo": default_combo,
+        "full_best_label": combo_label(full_best_combo),
+        "default_label": combo_label(default_combo),
+        "timing_note": timing_note,
+        "search_timing": search_timing,
+        "n_combos": len(combos),
         "train_n": train_n,
         "test_n": test_n,
         "train_years": train_years,
@@ -355,7 +540,7 @@ _WF_TEMPLATE = """<!DOCTYPE html>
   <div class="group">
     <h2>逐折明细</h2>
     <table id="folds"></table>
-    <div class="note">decay = 测试期夏普 − 训练期夏普。</div>
+    <div class="note">decay = 测试期夏普 − 训练期夏普。<span id="timing-note"></span></div>
   </div>
 </div>
 <script>
@@ -373,9 +558,9 @@ cards.innerHTML =
   card('Walk-Forward 样本外总收益', (wf.total_return*100).toFixed(1)+'%',
        '年化 '+(wf.annual_return*100).toFixed(1)+'% · 平均夏普 '+wf.avg_sharpe.toFixed(2)) +
   card('全样本最优（事后选参）', (fb.total_return*100).toFixed(1)+'%',
-       '同期对照，高于 WF 的部分是幻觉') +
+       DATA.full_best_label || '同期对照，高于 WF 的部分是幻觉') +
   card('默认参数（不调参）', (df.total_return*100).toFixed(1)+'%',
-       '不调参的基准线') +
+       DATA.default_label || '不调参的基准线') +
   card('正收益折占比', (wf.positive_folds*100).toFixed(0)+'%', wf.folds+' 折测试窗');
 
 const gap = fb.total_return - wf.total_return;
@@ -432,12 +617,13 @@ let fh = '<tr><th>折</th><th>训练期</th><th>测试期</th><th>选中参数</
 DATA.folds.forEach(f => {
   fh += `<tr><td>${f.fold}</td><td>${f.train_start}~${f.train_end}</td>
     <td>${f.test_start}~${f.test_end}</td>
-    <td>lb=${f.lookback} n=${f.top_n} buf=${f.buffer}</td>
+    <td>${f.chosen}</td>
     <td>${f.train_sharpe.toFixed(2)}</td><td>${f.test_sharpe.toFixed(2)}</td>
     <td class="${f.decay>=0?'pos':'neg'}">${f.decay>=0?'+':''}${f.decay.toFixed(2)}</td>
     ${pct(f.test_return)}${pct(f.test_max_drawdown)}</tr>`;
 });
 document.getElementById('folds').innerHTML = fh;
+document.getElementById('timing-note').textContent = DATA.timing_note || '';
 
 window.addEventListener('resize', () => { cv.resize(); dc.resize(); });
 </script></body></html>
@@ -498,6 +684,9 @@ def build_wf_report(res: dict, out_html: str, title: str = "样本外验证（Wa
         "summary": summary_payload,
         "eq_x": [f"第{i+1}折" for i in range(max_len)],
         "eq": eq,
+        "timing_note": res.get("timing_note", ""),
+        "full_best_label": res.get("full_best_label", ""),
+        "default_label": res.get("default_label", ""),
     }
 
     html = (_WF_TEMPLATE
@@ -529,7 +718,7 @@ _TEMPLATE = """<!DOCTYPE html>
   th { background:var(--surface); color:var(--muted); font-weight:600; position:sticky; top:0; }
   td:first-child,th:first-child { text-align:left; }
   tr:nth-child(even) td { background:#fcfcfc; }
-  .pos { color:#389e0d; } .neg { color:#d4380d; }
+  .pos { color:#cf1322; } .neg { color:#389e0d; }
   .note { color:var(--muted); font-size:12px; margin-top:8px; }
 </style>
 </head>
@@ -538,9 +727,16 @@ _TEMPLATE = """<!DOCTYPE html>
   <h1>__TITLE__</h1>
   <div class="sub">__SUBTITLE__</div>
   <div class="group">
-    <h2>夏普热力图（按 lookback × top_n，buffer 取均值）</h2>
+    <h2>夏普热力图（按 lookback × top_n，其余维度取均值）</h2>
     <div class="chart" id="heat"></div>
-    <div class="note">颜色越红夏普越高；横轴 top_n、纵轴 lookback。看清「哪片区域普遍好」，比单点最优更抗过拟合。</div>
+    <div class="note">颜色越红夏普越高；横轴 top_n、纵轴 lookback。看清「哪片区域普遍好」，比单点最优更抗过拟合。
+      同时扫了择时参数时，这里的每个格子是「该 lookback×top_n 下所有择时配置的平均」。</div>
+  </div>
+  <div class="group" id="timing-group" style="display:none">
+    <h2>择时维度对比（各配置的组内平均指标）</h2>
+    <div class="chart" id="timing"></div>
+    <div class="note">同一择时模式下的平均总收益 / 夏普 / 最大回撤。若「不择时（off）」的平均夏普最高，
+      说明这一轮里择时参数整体是在减分——之前某个单点配置的「三项全改善」大概率是全样本拟合。</div>
   </div>
   <div class="group">
     <h2>全部组合明细（按夏普降序）</h2>
@@ -563,7 +759,7 @@ heat.setOption({
   xAxis:{ type:'category', data:topNs.map(function(n){return 'n='+n;}), axisLine:axisCommon.axisLine, axisLabel:axisCommon.axisLabel, name:'top_n', nameLocation:'middle', nameGap:34 },
   yAxis:{ type:'category', data:lookbacks.map(function(l){return 'lb='+l;}), axisLine:axisCommon.axisLine, axisLabel:axisCommon.axisLabel, name:'lookback', nameLocation:'middle', nameGap:56 },
   visualMap:{ min:minV, max:maxV, calculable:true, orient:'horizontal', left:'center', bottom:10,
-    inRange:{ color:['#d4380d','#fdf2e0','#389e0d'] } },
+    inRange:{ color:['#389e0d','#fdf2e0','#d4380d'] } },
   series:[{ type:'heatmap', data:DATA.heat,
     label:{ show:true, formatter:function(p){return p.value[2].toFixed(2);}, color:'#1f2329', fontSize:11 },
     emphasis:{ itemStyle:{ shadowBlur:8, shadowColor:'rgba(0,0,0,0.3)' } } }]
@@ -578,12 +774,42 @@ DATA.rows.forEach(function(r){
     const v = r[c.key];
     if (c.fmt === 'pct') { const cls = v>=0?'pos':'neg'; tds += '<td class="'+cls+'">'+(v*100).toFixed(1)+'%</td>'; }
     else if (c.fmt === 'int') { tds += '<td>'+v+'</td>'; }
+    else if (c.fmt === 'txt') { tds += '<td>'+(v===null||v===undefined?'-':v)+'</td>'; }
     else { tds += '<td>'+ (typeof v==='number'? v.toFixed(2): v) +'</td>'; }
   });
   html += '<tr>'+tds+'</tr>';
 });
 tbl.innerHTML = html;
-window.addEventListener('resize', function(){ heat.resize(); });
+
+// 择时维度对比（只在扫了择时参数时出现）
+let timingChart = null;
+if (DATA.timing_groups && DATA.timing_groups.length > 1) {
+  document.getElementById('timing-group').style.display = '';
+  timingChart = echarts.init(document.getElementById('timing'));
+  const tg = DATA.timing_groups;
+  timingChart.setOption({
+    tooltip:{ trigger:'axis', axisPointer:{type:'shadow'} },
+    legend:{ top:0, data:['平均总收益','平均夏普','平均最大回撤'] },
+    grid:{ left:70, right:70, top:40, bottom:40 },
+    xAxis:{ type:'category', data:tg.map(function(g){return g.name+' (n='+g.n+')';}),
+            axisLine:axisCommon.axisLine, axisLabel:axisCommon.axisLabel },
+    yAxis:[
+      { type:'value', name:'收益 / 回撤', axisLabel:{formatter:function(v){return (v*100).toFixed(0)+'%';}, color:'#6b7280'}, ...axisCommon },
+      { type:'value', name:'夏普', position:'right', axisLabel:{color:'#6b7280'}, ...axisCommon }
+    ],
+    series:[
+      { name:'平均总收益', type:'bar', barMaxWidth:26, itemStyle:{ color:'#91caff' },
+        data:tg.map(function(g){return g.avg_return;}) },
+      { name:'平均最大回撤', type:'bar', barMaxWidth:26, itemStyle:{ color:'#ffccc7' },
+        data:tg.map(function(g){return g.avg_dd;}) },
+      { name:'平均夏普', type:'line', yAxisIndex:1, symbolSize:9,
+        lineStyle:{width:2, color:'#cf1322'}, itemStyle:{ color:'#cf1322' },
+        data:tg.map(function(g){return g.avg_sharpe;}) }
+    ]
+  });
+}
+
+window.addEventListener('resize', function(){ heat.resize(); if (timingChart) timingChart.resize(); });
 </script>
 </body>
 </html>
@@ -592,7 +818,7 @@ window.addEventListener('resize', function(){ heat.resize(); });
 
 def build_grid_report(results: pd.DataFrame, out_html: str,
                       title: str = "参数优化网格搜索", subtitle: str = "") -> None:
-    """生成自包含 HTML：夏普热力图 + 全组合明细表。"""
+    """生成自包含 HTML：夏普热力图 + 择时维度对比 + 全组合明细表。"""
     top_ns = sorted(results["top_n"].unique().tolist())
     lookbacks = sorted(results["lookback"].unique().tolist())
 
@@ -606,11 +832,30 @@ def build_grid_report(results: pd.DataFrame, out_html: str,
                 if pd.notna(v):
                     heat.append([xi, yi, round(float(v), 3)])
 
+    # 择时维度对比：同一择时模式下所有组合的平均表现
+    timing_groups = []
+    if "timing" in results.columns:
+        for tm, sub in results.groupby("timing", sort=False):
+            sub = sub.dropna(subset=["sharpe"])
+            if not len(sub):
+                continue
+            timing_groups.append({
+                "name": "不择时" if str(tm).lower() in ("off", "none", "") else str(tm),
+                "n": int(len(sub)),
+                "avg_return": round(float(sub["total_return"].mean()), 4),
+                "avg_sharpe": round(float(sub["sharpe"].mean()), 3),
+                "avg_dd": round(float(sub["max_drawdown"].mean()), 4),
+            })
+
     ordered = results.sort_values("sharpe", ascending=False)
     columns = [
+        {"key": "combo", "label": "参数组合", "fmt": "txt"},
         {"key": "lookback", "label": "lookback", "fmt": "int"},
         {"key": "top_n", "label": "top_n", "fmt": "int"},
         {"key": "buffer", "label": "buffer", "fmt": "int"},
+        {"key": "timing", "label": "择时", "fmt": "txt"},
+        {"key": "timing_lookback", "label": "择时窗口", "fmt": "int"},
+        {"key": "timing_band", "label": "滞回带", "fmt": "pct"},
         {"key": "total_return", "label": "总收益", "fmt": "pct"},
         {"key": "annual_return", "label": "年化", "fmt": "pct"},
         {"key": "sharpe", "label": "夏普", "fmt": "num"},
@@ -622,15 +867,17 @@ def build_grid_report(results: pd.DataFrame, out_html: str,
         {"key": "excess_return", "label": "超额收益", "fmt": "pct"},
         {"key": "information_ratio", "label": "信息比率", "fmt": "num"},
     ]
-    # 仅保留结果里实际存在的列
-    columns = [c for c in columns if c["key"] in results.columns]
+    # 仅保留结果里实际存在的列（excess_return 等在没基准时会缺席）
+    columns = [c for c in columns if c["key"] == "combo" or c["key"] in results.columns]
     rows = []
     for _, r in ordered.iterrows():
-        rows.append({c["key"]: r[c["key"]] for c in columns})
+        rec = {c["key"]: r[c["key"]] for c in columns if c["key"] != "combo"}
+        rec["combo"] = combo_label(rec)
+        rows.append(rec)
 
     payload = {
         "top_ns": top_ns, "lookbacks": lookbacks, "heat": heat,
-        "columns": columns, "rows": rows,
+        "timing_groups": timing_groups, "columns": columns, "rows": rows,
     }
     html = (_TEMPLATE
             .replace("__TITLE__", title)
