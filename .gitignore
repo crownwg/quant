@@ -84,6 +84,8 @@ htmlcov/
 # pytest 默认往系统 Temp 写临时目录，沙箱环境里常被拦；
 # 用 --basetemp=.pytest_tmp 把它落到项目内，记得别提交
 .pytest_tmp/
-# 一次性的验证/检查脚本（不是项目代码，删掉无妨）
-_skill_*.py
-_skill_tmp_check.js
+# 一次性的验证 / 检查脚本与临时输出（不是项目代码，删掉无妨）
+# 项目正经文件都在 quant/ 、tests/ 下，根目录不用 _ 开头的名字
+/_*.py
+/_*.js
+/_*.json
