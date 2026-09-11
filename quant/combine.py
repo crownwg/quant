@@ -23,9 +23,9 @@ import json
 import pandas as pd
 import numpy as np
 
-from . import factors, filters, universe, neutralize
+from . import factors, filters, universe, neutralize, timing
 from .backtest import run as backtest_run, cost_kwargs
-from .data import load_panel
+from .data import load_index, load_panel
 from .strategy import factor_weights, weights_from_args
 
 
@@ -101,6 +101,42 @@ def parse_weights(text: str, n: int) -> list[float]:
 
 # ------------------------------------------------------------- 单池回测
 
+def _pool_exposure(args, pool: str, prices_all: pd.DataFrame, fetch_start: str):
+    """多池组合模式下的择时：**每个池子按自己的趋势独立开关**。
+
+    为什么不在组合层做统一择时：各池的趋势并不同步（消费和医药见顶的时间
+    可能差几个月），统一开关会把「该撤的池子」和「该留的池子」一起处理掉。
+    分池择时等价于「每个 sleeve 有自己的风险开关」，更贴近实际使用。
+
+    代理指数：--timing-proxy 为 benchmark/auto 且提供了 --benchmark 时用基准；
+    否则用该池自己的等权组合——衡量「我持有的这类资产的自身趋势」，
+    交易单一行业池时通常比宽基指数更贴切。
+    """
+    timing_on = (getattr(args, "timing", "off") or "off") != "off"
+    vol_on = float(getattr(args, "vol_target", 0.0) or 0.0) > 0
+    if not timing_on and not vol_on:
+        return None
+
+    spec = (getattr(args, "timing_proxy", "auto") or "auto").strip()
+    sym = ""
+    if spec in ("benchmark", "auto"):
+        sym = getattr(args, "benchmark", "") or ""
+    elif spec != "pool":
+        sym = spec
+
+    proxy, label = None, f"池子等权组合({pool})"
+    if sym:
+        try:
+            proxy = load_index(timing.norm_index_symbol(sym), fetch_start, args.end)
+            proxy.index = pd.to_datetime(proxy.index)
+            label = f"指数 {sym}"
+        except Exception as exc:  # noqa: BLE001
+            print(f"    ⚠️ 择时代理 {sym} 获取失败，回退到该池等权组合: {exc}")
+            proxy = None
+    return timing.build_exposure(args, proxy=proxy, prices=prices_all,
+                                 proxy_label=label, verbose=True)
+
+
 def run_one_pool(pool: str, strategy: str, args, fetch_start: str, start_ts: pd.Timestamp):
     """跑一个 (pool, strategy) 的完整回测，返回 (equity, metrics, code_count)。
 
@@ -157,7 +193,8 @@ def run_one_pool(pool: str, strategy: str, args, fetch_start: str, start_ts: pd.
     weight_cap_all = filters.capacity_cap(
         adv_all, args.capital, getattr(args, "max_participation", 0.0))
     weights = weights_from_args(score, args, can_buy=can_buy, can_sell=can_sell,
-                                prices=prices_all, weight_cap=weight_cap_all)
+                                prices=prices_all, weight_cap=weight_cap_all,
+                                exposure=_pool_exposure(args, pool, prices_all, fetch_start))
     keep = prices_all.index >= start_ts
     p = prices_all.loc[keep]; o = open_all.loc[keep]; w = weights.loc[keep]
     equity, metrics, _ = run_one_backtest(p, w, o if args.use_open else None,

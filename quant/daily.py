@@ -34,7 +34,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from . import factors, filters
+from . import factors, filters, timing
 from .backtest import run as backtest_run, cost_kwargs
 from .data import load_index, load_panel
 from .rebalance import build_plan
@@ -81,6 +81,20 @@ def merge_args_config(args, cfg: dict) -> dict:
         "impact_coef": cfg.get("impact_coef", 0.0),
         "min_listed_days": cfg.get("min_listed_days", 0),
         "as_of": cfg.get("as_of", ""),
+        # 择时仓位（默认关闭；开启后目标权重会被敞口缩放，清单里自动体现减仓）
+        "timing": cfg.get("timing", "off"),
+        "timing_lookback": cfg.get("timing_lookback", 120),
+        "timing_band": cfg.get("timing_band", 0.0),
+        "timing_ma_slope": cfg.get("timing_ma_slope", 0),
+        "timing_min_exposure": cfg.get("timing_min_exposure", 0.0),
+        "timing_max_exposure": cfg.get("timing_max_exposure", 1.0),
+        "timing_smooth": cfg.get("timing_smooth", 0),
+        "timing_proxy": cfg.get("timing_proxy", "pool"),
+        "timing_update": cfg.get("timing_update", "rebalance"),
+        "vol_target": cfg.get("vol_target", 0.0),
+        "vol_target_lookback": cfg.get("vol_target_lookback", 60),
+        "vol_floor": cfg.get("vol_floor", 0.2),
+        "vol_cap": cfg.get("vol_cap", 1.0),
         "no_limit_filter": cfg.get("no_limit_filter", False),
         "no_suspend_filter": cfg.get("no_suspend_filter", False),
         "benchmark": args.benchmark or cfg.get("benchmark", "sh000932"),
@@ -142,6 +156,10 @@ def run_daily(cfg: dict) -> dict:
     lookback_days = cfg["fetch_lookback_days"]
     if cfg["min_listed_days"] > 0:
         lookback_days = max(lookback_days, cfg["min_listed_days"] + 30)
+    # 择时的滚动窗口（均线 / 已实现波动率）也要预热，否则评估期开头会被迫空仓
+    timing_need = max(int(cfg.get("timing_lookback", 0) or 0),
+                      int(cfg.get("vol_target_lookback", 0) or 0)) * 2 + 30
+    lookback_days = max(lookback_days, timing_need)
     fetch_start = (today - pd.Timedelta(days=lookback_days)).strftime("%Y%m%d")
     end = today.strftime("%Y%m%d")
     start = (today - pd.Timedelta(days=lookback_days - 30)).strftime("%Y%m%d")
@@ -185,8 +203,31 @@ def run_daily(cfg: dict) -> dict:
         score = score.where(filters.listing_age_mask(prices_all, cfg["min_listed_days"]))
     weight_cap_all = filters.capacity_cap(
         adv_all, cfg["capital"], cfg.get("max_participation", 0.0))
+
+    # ---- 择时仓位：决定今日该放多少资金在场 ----
+    exposure = None
+    if (cfg.get("timing") or "off") != "off" or float(cfg.get("vol_target") or 0.0) > 0:
+        proxy, label = None, f"池子等权组合({cfg['pool']})"
+        spec = (cfg.get("timing_proxy") or "pool").strip()
+        sym = ""
+        if spec in ("benchmark", "auto"):
+            sym = cfg.get("benchmark") or ""
+        elif spec != "pool":
+            sym = spec
+        if sym:
+            try:
+                proxy = load_index(timing.norm_index_symbol(sym), fetch_start, end)
+                proxy.index = pd.to_datetime(proxy.index)
+                label = f"指数 {sym}"
+            except Exception as exc:  # noqa: BLE001
+                print(f"  ⚠️ 择时代理 {sym} 获取失败，回退到池子等权组合: {exc}")
+                proxy = None
+        exposure = timing.build_exposure(cfg, proxy=proxy, prices=prices_all,
+                                         proxy_label=label, verbose=True)
+
     weights = weights_from_args(score, cfg, can_buy=can_buy, can_sell=can_sell,
-                                prices=prices_all, weight_cap=weight_cap_all)
+                                prices=prices_all, weight_cap=weight_cap_all,
+                                exposure=exposure)
 
     # 切片到「近期评估期」（默认 5 年）
     eval_start = today - pd.Timedelta(days=365 * 5)

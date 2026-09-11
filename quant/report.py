@@ -96,6 +96,12 @@ _TEMPLATE = """<!DOCTYPE html>
     <table class="attr-table" id="attr-table"></table>
   </div>
 
+  <div class="group" id="exposure-group">
+    <h2>择时仓位（敞口）</h2>
+    <div class="chart" id="exposure-chart"></div>
+    <div class="note">敞口 = 该交易日投入市场的资金比例，其余为现金。净值曲线上的收益已经过敞口缩放，因此这条线直接回答「什么时候在场、在场放多少」。阶梯状说明是 0/1 趋势开关，曲线状说明含波动率目标的连续缩放。</div>
+  </div>
+
   <div class="group" id="plan-group">
     <h2>调仓清单摘要</h2>
     <div class="cards" id="plan-cards"></div>
@@ -202,6 +208,23 @@ if (DATA.annual && DATA.annual.length) {
   });
 } else { ag.style.display = 'none'; }
 
+// 择时敞口
+var exc = null;
+const eg = document.getElementById('exposure-group');
+if (DATA.exposure && DATA.exposure.length) {
+  exc = echarts.init(document.getElementById('exposure-chart'));
+  exc.setOption({
+    tooltip: { trigger: 'axis', valueFormatter: function (v) { return (v * 100).toFixed(0) + '%'; } },
+    grid: grid,
+    xAxis: { type: 'category', data: DATA.dates, axisLine: axisCommon.axisLine, axisLabel: axisCommon.axisLabel },
+    yAxis: { type: 'value', min: 0, max: 1, axisLine: axisCommon.axisLine,
+      axisLabel: { color: '#6b7280', formatter: function (v) { return (v * 100).toFixed(0) + '%'; } } },
+    series: [{ name: '仓位', type: 'line', step: 'end', showSymbol: false, data: DATA.exposure,
+      areaStyle: { color: 'rgba(47,109,240,0.10)' },
+      lineStyle: { width: 1.5, color: '#2f6df0' }, itemStyle: { color: '#2f6df0' } }]
+  });
+} else { eg.style.display = 'none'; }
+
 // 风险归因
 const atg = document.getElementById('attribution-group');
 if (DATA.attribution && DATA.attribution.length) {
@@ -259,7 +282,7 @@ if (DATA.attribution && DATA.attribution.length) {
   tbl.innerHTML = html;
 } else { atg.style.display = 'none'; }
 
-window.addEventListener('resize', function () { ec.resize(); dd.resize(); if (rc) rc.resize(); if (ac) ac.resize(); if (atc) atc.resize(); if (acc) acc.resize(); });
+window.addEventListener('resize', function () { ec.resize(); dd.resize(); if (rc) rc.resize(); if (ac) ac.resize(); if (exc) exc.resize(); if (atc) atc.resize(); if (acc) acc.resize(); });
 </script>
 </body>
 </html>
@@ -281,6 +304,7 @@ def build_report(data: dict, out_html: str) -> None:
         benchmark      [float, ...] | None       基准净值
         drawdown       [float, ...]              策略回撤（负值）
         bench_dd       [float, ...] | None       基准回撤
+        exposure       [float, ...] | None       择时敞口（0~1），None 则不显示该图
         plan           {label: value, ...} | None  调仓摘要
         annual         [{year, return, sharpe, max_drawdown}, ...] | None  分年度表现
         rolling_dates  [str, ...] | None           滚动净值横轴

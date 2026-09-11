@@ -50,9 +50,11 @@ from . import attribution
 from . import grid
 from . import compare
 from . import combine
+from . import timing
 from . import neutralize
 from . import factor_eval
 from .backtest import cost_kwargs
+from .strategy import apply_exposure
 
 
 # ----------------------------------------------------------- 因子构造
@@ -124,10 +126,12 @@ def build_score(args, prices: pd.DataFrame, volume: pd.DataFrame) -> pd.DataFram
 PCT_METRICS = {
     "total_return", "annual_return", "max_drawdown", "annual_volatility", "win_rate",
     "average_daily_turnover", "annual_turnover",
-    "total_commission", "total_stamp_tax", "total_cost", "cost_drag_annual",
+    "total_commission", "total_stamp_tax", "total_slippage", "total_impact",
+    "total_cost", "cost_drag_annual",
     "excess_return",
+    "avg_exposure", "in_market_ratio",
 }
-INT_METRICS = {"max_drawdown_days", "trading_days"}
+INT_METRICS = {"max_drawdown_days", "trading_days", "exposure_switches"}
 
 GROUPS = [
     ("收益", ["total_return", "annual_return", "final_equity"]),
@@ -137,6 +141,7 @@ GROUPS = [
     ("交易成本（占本金比例）", ["total_commission", "total_stamp_tax", "total_slippage",
                             "total_impact", "total_cost", "cost_drag_annual"]),
     ("相对基准", ["excess_return", "information_ratio"]),
+    ("择时仓位（启用后才有）", ["avg_exposure", "in_market_ratio", "exposure_switches"]),
     ("样本", ["trading_days", "years"]),
 ]
 
@@ -162,6 +167,9 @@ LABELS = {
     "cost_drag_annual": "成本年化拖累",
     "excess_return": "超额收益",
     "information_ratio": "信息比率",
+    "avg_exposure": "平均仓位",
+    "in_market_ratio": "在场交易日占比（仓位>50%）",
+    "exposure_switches": "仓位切换次数",
     "trading_days": "交易日数",
     "years": "回测年数",
 }
@@ -180,6 +188,51 @@ def pool_display(codes: list[str], head: int = 12) -> str:
     if len(codes) <= head:
         return f"{len(codes)}只 {','.join(codes)}"
     return f"{len(codes)}只 {','.join(codes[:head])} 等"
+
+
+def _norm_index_symbol(sym: str) -> str:
+    """把裸指数代码补上交易所前缀（实现见 timing.norm_index_symbol，两处共用一份规则）。"""
+    return timing.norm_index_symbol(sym)
+
+
+def resolve_exposure(args, prices_all: pd.DataFrame, fetch_start: str):
+    """构造择时敞口序列（0~1），未启用择时时返回 None。
+
+    --timing-proxy 决定拿什么当「市场」：
+      benchmark : --benchmark 指定的指数
+      pool      : 所交易池子的等权组合（衡量「我持有的这类资产的自身趋势」）
+      auto      : 有 --benchmark 就用基准，否则用池子等权组合
+      其他任意值 : 当作指数代码，如 000932（中证消费）→ 自动补前缀
+
+    选基准还是池子，取决于你想对冲的是「市场 beta」还是「这个行业的 beta」。
+    交易消费池时，用中证消费指数（sh000932）通常比沪深300更贴切。
+    """
+    timing_on = (getattr(args, "timing", "off") or "off") != "off"
+    vol_on = float(getattr(args, "vol_target", 0.0) or 0.0) > 0
+    if not timing_on and not vol_on:
+        return None
+
+    spec = (getattr(args, "timing_proxy", "auto") or "auto").strip()
+    sym = ""
+    if spec in ("benchmark", "auto"):
+        if args.benchmark:
+            sym = args.benchmark
+    elif spec != "pool":
+        sym = spec
+
+    proxy, label = None, "池子等权组合"
+    if sym:
+        sym = _norm_index_symbol(sym)
+        try:
+            proxy = load_index(sym, fetch_start, args.end)
+            proxy.index = pd.to_datetime(proxy.index)
+            label = f"指数 {sym}"
+        except Exception as exc:  # noqa: BLE001
+            print(f"⚠️ 择时代理指数 {sym} 获取失败，回退到池子等权组合: {exc}")
+            proxy = None
+
+    return timing.build_exposure(args, proxy=proxy, prices=prices_all,
+                                 proxy_label=label, verbose=True)
 
 
 def _build_today_plan(plan: pd.DataFrame, prices: pd.DataFrame,
@@ -389,6 +442,40 @@ def make_parser() -> argparse.ArgumentParser:
     p.add_argument("--regime-band", type=float, default=0.05,
                    help="牛熊阈值：基准过去 N 日收益 ≥ +band 为牛、≤ -band 为熊，默认 0.05")
 
+    # 择时与仓位管理
+    p.add_argument("--timing", default="off", choices=list(timing.TIMING_MODES),
+                   help="趋势择时：off 关闭 / ma 价格对均线 / momentum 过去N日收益为正 / "
+                        "dual 均线+斜率双确认。输出 0~1 的仓位系数，剩余部分留现金")
+    p.add_argument("--timing-lookback", type=int, default=120,
+                   help="趋势择时窗口（交易日），默认 120")
+    p.add_argument("--timing-band", type=float, default=0.0,
+                   help="滞回带：空仓转满仓需高于均线×(1+band)、满仓转空仓需低于×(1-band)，"
+                        "中间维持原状态。0.02~0.05 能显著减少均线附近的来回打脸")
+    p.add_argument("--timing-min-exposure", type=float, default=0.0,
+                   help="出场时的最低仓位，默认 0（完全空仓）。设 0.3 表示看空也只减到三成")
+    p.add_argument("--timing-max-exposure", type=float, default=1.0,
+                   help="最高仓位，默认 1.0（不加杠杆）")
+    p.add_argument("--timing-ma-slope", type=int, default=0,
+                   help="dual 模式判断「均线向上」的回看天数，0=自动取 timing-lookback/10")
+    p.add_argument("--timing-smooth", type=int, default=0,
+                   help="对仓位序列做 N 日移动平均，降低仓位自身的换手（会引入轻微滞后）")
+    p.add_argument("--timing-update", default="rebalance", choices=["rebalance", "daily"],
+                   help="仓位更新频率：rebalance（默认）只在调仓日调整仓位、与选股同步；"
+                        "daily 逐日调整。逐日会让月频策略退化成日频对倒"
+                        "（实测 17000+ 笔订单把收益吃光），仅用于观察代价")
+    p.add_argument("--timing-proxy", default="auto",
+                   help="择时代理：auto（有基准用基准，否则用池子等权组合）/ benchmark / "
+                        "pool（池子等权组合，衡量所持资产的自身趋势）/ 或直接给指数代码如 000932")
+    p.add_argument("--vol-target", type=float, default=0.0,
+                   help="波动率目标：仓位 = 目标年化波动率 / 已实现波动率。0=关闭。"
+                        "如 0.15 表示把组合波动压到 15%% 附近")
+    p.add_argument("--vol-target-lookback", type=int, default=60,
+                   help="已实现波动率的滚动窗口（交易日），默认 60")
+    p.add_argument("--vol-floor", type=float, default=0.2,
+                   help="波动率目标的仓位下限，默认 0.2")
+    p.add_argument("--vol-cap", type=float, default=1.0,
+                   help="波动率目标的仓位上限，默认 1.0（不加杠杆）")
+
     # 参数优化（网格搜索）
     p.add_argument("--grid", action="store_true",
                    help="参数优化：在 (lookback × top_n × buffer) 网格上回测，找稳健最优参数")
@@ -463,8 +550,13 @@ def main() -> None:
             print(f"  · {r['pool']}（{r['n_codes']} 只）：{r['message']}")
         print("!" * 68 + "\n", flush=True)
 
-    # 预热期：因子需要历史数据才能计算，往前多取一段，否则开头几个月空仓
-    warm_days = max(args.lookback, args.ma_long, args.vol_lookback, args.vol_long) * 2 + 30
+    # 预热期：因子需要历史数据才能计算，往前多取一段，否则开头几个月空仓。
+    # 择时的滚动窗口（均线 / 已实现波动率）同样需要预热，否则回测开头会被迫空仓。
+    factor_warm = max(args.lookback, args.ma_long, args.vol_lookback, args.vol_long)
+    timing_warm = max(int(getattr(args, "timing_lookback", 0) or 0),
+                      int(getattr(args, "vol_target_lookback", 0) or 0),
+                      int(getattr(args, "timing_smooth", 0) or 0))
+    warm_days = max(factor_warm, timing_warm) * 2 + 30
     # 次新股过滤按「上市自然日」判断，面板必须比回测起点再往前 min_listed_days，
     # 否则老股票的可用历史会被误判成"刚上市"而被整体剔除。
     if args.min_listed_days > 0:
@@ -574,6 +666,13 @@ def main() -> None:
             print(f"  其他不可交易: {' + '.join(parts)}"
                   f" | 合计禁买{limit_stats.get('blocked_buy', 0)}/禁卖{limit_stats.get('blocked_sell', 0)}")
 
+    # ---- 择时仓位：决定「什么时候在场、在场放多少」----
+    # 必须放在参数扫描分支之前：网格 / 对比 / 滚动都要用同一份敞口，
+    # 否则会出现「主回测算择时、网格搜索没算」的口径分裂。
+    exposure = None
+    if codes:
+        exposure = resolve_exposure(args, prices_all, fetch_start)
+
     # ---- 因子有效性检验：直接回答「因子有没有用」，与回测相互独立----
     if args.factor_eval:
         print("\n【因子有效性检验】横截面 Rank IC（未来 20 日收益）")
@@ -623,7 +722,7 @@ def main() -> None:
         start_ts = pd.Timestamp(args.start)
         res = grid.grid_search(prices_all, open_all, can_buy, can_sell, args,
                                lookbacks, top_ns, buffers, start_ts, benchmark_curve=bench,
-                               weight_cap=weight_cap_all)
+                               weight_cap=weight_cap_all, exposure=exposure)
         res.to_csv(f"{args.out_prefix}grid_results.csv", index=False)
         sub = (f"池子 {len(codes)}只 · 区间 {args.start}~{args.end} · "
                f"网格 {len(lookbacks)}×{len(top_ns)}×{len(buffers)} · 基准 {args.benchmark or '无'}")
@@ -651,7 +750,8 @@ def main() -> None:
             prices_all, open_all, can_buy, can_sell, args,
             lookbacks, top_ns, buffers, start_ts,
             train_years=args.fw_train, test_years=args.fw_test,
-            weight_cap=weight_cap_all, select_metric=args.fw_metric)
+            weight_cap=weight_cap_all, select_metric=args.fw_metric,
+            exposure=exposure)
         res["folds"].to_csv(f"{args.out_prefix}wf_folds.csv", index=False)
         res["summary"].to_csv(f"{args.out_prefix}wf_summary.csv", index=False)
         grid.build_wf_report(
@@ -694,6 +794,7 @@ def main() -> None:
         results_df, equity_dict, annual_dict, params_dict = compare.run_compare(
             prices_all, open_all, volume_all, can_buy, can_sell,
             strategies, args, benchmark_curve=bench, weight_cap=weight_cap_all,
+            exposure=exposure,
         )
         results_df.to_csv(f"{args.out_prefix}compare_results.csv", index=False)
         sub = (f"池子 {len(codes)}只 · 区间 {args.start}~{args.end} · "
@@ -753,7 +854,8 @@ def main() -> None:
         return
 
     weights_all = weights_from_args(score, args, can_buy=can_buy, can_sell=can_sell,
-                                    prices=prices_all, weight_cap=weight_cap_all)
+                                    prices=prices_all, weight_cap=weight_cap_all,
+                                    exposure=exposure)
 
     # 截掉预热期，只在用户指定区间上评价
     start_ts = pd.Timestamp(args.start)
@@ -770,6 +872,16 @@ def main() -> None:
                                   open_prices=open_prices if args.use_open else None,
                                   **cost_kwargs(args))
 
+    # ---- 择时仓位统计（并入指标，并作为报告的一条曲线）----
+    exposure_eval = None
+    if exposure is not None:
+        exposure_eval = exposure.reindex(equity.index).ffill().fillna(1.0).clip(lower=0.0)
+        es = timing.exposure_summary(exposure_eval)
+        metrics["avg_exposure"] = es["avg_exposure"]
+        metrics["in_market_ratio"] = es["in_market_ratio"]
+        metrics["exposure_switches"] = float(es["switches"])
+        detail["exposure"] = exposure_eval
+
     # ---- 分年度稳健性分解（默认输出）----
     annual = rolling.annual_breakdown(equity, detail)
     annual.to_csv(f"{args.out_prefix}annual_metrics.csv", index=False)
@@ -785,7 +897,7 @@ def main() -> None:
         if windows:
             roll_results = rolling.run_rolling(
                 score, prices_all, open_all, can_buy, can_sell, args, windows,
-                weight_cap=weight_cap_all)
+                weight_cap=weight_cap_all, exposure=exposure)
             rolling_equity = rolling.concat_equity(roll_results)
             rolling_table = pd.DataFrame([
                 {"start": r[0].date(), "end": r[1].date(), **r[3]} for r in roll_results
@@ -885,6 +997,17 @@ def main() -> None:
                    "score": "分数加权", "rank": "排名加权"}[args.weighting]
     print(f"  权重方案    : {weight_desc}"
           + (f" · 单票上限 {args.max_weight:.0%}" if args.max_weight > 0 else ""))
+    if exposure is not None:
+        tm_parts = []
+        if args.timing != "off":
+            tm_parts.append(f"趋势 {args.timing}({args.timing_lookback}日"
+                            + (f",带{args.timing_band:.1%}" if args.timing_band else "") + ")")
+        if args.vol_target > 0:
+            tm_parts.append(f"波动率目标 {args.vol_target:.0%}(下限 {args.vol_floor:.0%})")
+        upd = "仅调仓日更新" if args.timing_update == "rebalance" else "逐日更新"
+        print(f"  择时仓位    : {' × '.join(tm_parts)}"
+              + (f" · 最低仓位 {args.timing_min_exposure:.0%}" if args.timing_min_exposure > 0 else "")
+              + f" · 代理 {args.timing_proxy} · {upd}")
     if args.neutralize.strip():
         print(f"  因子中性化  : {args.neutralize}")
     cost_desc = (f"佣金 {args.fee:.4%}(最低 {args.min_commission:g}元/笔)"
@@ -948,10 +1071,20 @@ def main() -> None:
         plan_cards["累计卖出"] = f"{plan_stats['total_sell_amount']:,.0f}"
         plan_cards["费用合计"] = f"{plan_stats['total_commission'] + plan_stats['total_stamp_tax']:,.2f}"
 
+    timing_desc = ""
+    if exposure is not None:
+        tp = []
+        if args.timing != "off":
+            tp.append(f"趋势{args.timing}({args.timing_lookback}日)")
+        if args.vol_target > 0:
+            tp.append(f"波动率目标{args.vol_target:.0%}")
+        timing_desc = " + ".join(tp)
+
     report_data = {
         "title": "A股低频选股策略回测报告",
         "subtitle": (f"策略 {args.factors or args.strategy} · 股票池 {len(codes)}只 · "
-                     f"区间 {args.start}~{args.end} · 基准 {args.benchmark or '无'}"),
+                     f"区间 {args.start}~{args.end} · 基准 {args.benchmark or '无'}"
+                     + (f" · 择时 {timing_desc}" if timing_desc else "")),
         "config": [
             ("策略", args.factors or args.strategy),
             ("股票池", pool_display(codes)),
@@ -959,13 +1092,15 @@ def main() -> None:
             ("调仓频率", f"每{args.rebalance} 选前{args.top_n}"),
             ("成交价", "次日开盘价" if args.use_open else "当日收盘价"),
             ("基准", args.benchmark or "无"),
-        ],
+        ] + ([("择时仓位", timing_desc)] if timing_desc else []),
         "metrics_groups": metrics_groups,
         "dates": [d.strftime("%Y-%m-%d") for d in equity.index],
         "equity": [round(float(v), 4) for v in equity.values],
         "benchmark": [round(float(v), 4) for v in benchmark_curve.values] if benchmark_curve is not None else None,
         "drawdown": [round(float(v), 4) for v in drawdown.values],
         "bench_dd": [round(float(v), 4) for v in bench_dd.values] if bench_dd is not None else None,
+        "exposure": ([round(float(v), 4) for v in exposure_eval.values]
+                     if exposure_eval is not None else None),
         "plan": plan_cards,
         "annual": [
             {"year": int(r["year"]), "return": round(float(r["return"]), 4),

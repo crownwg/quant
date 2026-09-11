@@ -102,7 +102,8 @@ def parse_strategy_spec(text: str) -> list[str]:
 # ------------------------------------------------------- 主流程
 
 def run_compare(prices, open_prices, volume, can_buy, can_sell,
-                strategies, args, benchmark_curve=None, weight_cap=None):
+                strategies, args, benchmark_curve=None, weight_cap=None,
+                exposure=None):
     """逐策略跑回测，汇总指标 + 净值曲线 + 年度收益。
 
     返回
@@ -123,7 +124,8 @@ def run_compare(prices, open_prices, volume, can_buy, can_sell,
         cfg = PREDEFINED_STRATEGIES[name]
         score = cfg["builder"](args, prices, volume)
         weights = weights_from_args(score, args, can_buy=can_buy, can_sell=can_sell,
-                                    prices=prices, weight_cap=weight_cap)
+                                    prices=prices, weight_cap=weight_cap,
+                                    exposure=exposure)
         # 切片到用户回测区间
         keep = prices.index >= start_ts
         p = prices.loc[keep]

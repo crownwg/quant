@@ -68,7 +68,7 @@ def rolling_windows(n: int, window: int = 504, step: int | None = None,
 
 
 def run_rolling(score, prices, open_prices, can_buy, can_sell, args, windows,
-                weight_cap=None):
+                weight_cap=None, exposure=None):
     """对每段窗口独立回测，返回 [(start_date, end_date, equity, metrics), ...]。
 
     每段净值从上一窗口末值衔接，模拟「一直按策略投资」的连续曲线；
@@ -83,7 +83,8 @@ def run_rolling(score, prices, open_prices, can_buy, can_sell, args, windows,
         cb = can_buy.iloc[s:e] if can_buy is not None else None
         cs = can_sell.iloc[s:e] if can_sell is not None else None
         w = weights_from_args(sc, args, can_buy=cb, can_sell=cs, prices=pr,
-                              weight_cap=(weight_cap.iloc[s:e] if weight_cap is not None else None))
+                              weight_cap=(weight_cap.iloc[s:e] if weight_cap is not None else None),
+                              exposure=(exposure.iloc[s:e] if exposure is not None else None))
         eq, m, _det = run(pr, w, open_prices=op, **cost_kwargs(args))
         eq = eq * prev_end
         prev_end = float(eq.iloc[-1])

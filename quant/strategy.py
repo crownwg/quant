@@ -244,6 +244,50 @@ def factor_weights(score: pd.DataFrame, top_n: int = 10, freq: str = "M",
     return weights
 
 
+def apply_exposure(weights: pd.DataFrame, exposure: pd.Series | None) -> pd.DataFrame:
+    """把组合级敞口缩放到权重矩阵上：weights × exposure(t)。
+
+    敞口小于 1 的部分就是现金，所以缩放之后每行之和小于 1 是**预期行为**，
+    不是 bug。回测引擎按权重算收益与换手，因此仓位自身的调整也被正确地
+    计入了交易成本（趋势翻空时那一刻的卖出会真实产生费用）。
+
+    时机很重要：必须在**单票上限 / 容量上限都施加完之后**再做缩放。
+    如果反过来先缩放再施加上限，上限就不再是「权重的上限」而是
+    「缩放前权重的上限」，约束会失效。
+    """
+    if exposure is None:
+        return weights
+    ex = exposure.reindex(weights.index).ffill().fillna(1.0).clip(lower=0.0)
+    return weights.mul(ex, axis=0)
+
+
+def align_exposure(exposure: pd.Series, index: pd.DatetimeIndex, freq: str,
+                   mode: str = "rebalance") -> pd.Series:
+    """把敞口序列对齐到调仓节奏上。
+
+    为什么要做这一步（真实踩过的坑）
+    --------------------------------
+    选股是月频的，但仓位信号（尤其是波动率目标）是**逐日连续变化**的。
+    如果把逐日敞口直接乘到权重上，组合就变成了「每天都在调仓」——
+    实测某次回测因此产生 1125 次调仓、17041 笔订单，成本把所有收益吃光。
+    这跟「月频策略」的初衷完全相反，而且现实中也不可能执行。
+
+    修正：默认（mode="rebalance"）只在**调仓日**读取一次敞口，非调仓日沿用。
+    语义变成「每月调仓时，同时决定这个月放多少仓位」，与选股同步、口径自洽，
+    换手回到月频量级。
+
+    mode="daily" 则保留逐日更新（适合日频策略，或想观察高频调仓的代价时）。
+    """
+    if exposure is None:
+        return exposure
+    aligned = exposure.reindex(index).ffill().fillna(1.0)
+    if str(mode).lower() == "daily":
+        return aligned
+    flags = rebalance_flags(index, freq)
+    # 只在调仓日取值；调仓日之前无仓位可言（权重本身也是 0），填 0 更安全
+    return aligned[flags].reindex(index).ffill().fillna(0.0)
+
+
 def realized_vol(prices: pd.DataFrame, lookback: int = 60) -> pd.DataFrame:
     """已实现波动率面板（日收益标准差），供 weighting="inv_vol" 使用。"""
     return prices.pct_change().rolling(lookback).std()
@@ -258,18 +302,21 @@ def _cfg_get(cfg, key, default):
 
 def weights_from_args(score: pd.DataFrame, cfg, can_buy=None, can_sell=None,
                       prices: pd.DataFrame | None = None, vol: pd.DataFrame | None = None,
-                      weight_cap: pd.DataFrame | None = None, **overrides) -> pd.DataFrame:
+                      weight_cap: pd.DataFrame | None = None,
+                      exposure: pd.Series | None = None, **overrides) -> pd.DataFrame:
     """按统一的配置口径构造权重矩阵 —— 所有入口都应该走这里。
 
     为什么要抽这一层：main / grid / compare / combine / rolling / daily 六个入口
     各自拼一遍 factor_weights 的参数，历史上已经造成过口径分裂
     （典型：主回测接上了 exec_shift，滚动回测忘了接）。
-    新增的 weighting / max_weight / weight_cap 如果各自手接一遍，同样的坑会再犯一次。
+    新增的 weighting / max_weight / weight_cap / exposure 如果各自手接一遍，
+    同样的坑会再犯一次。
 
     cfg 可以是 argparse 命名空间，也可以是 daily.py 的 JSON dict。
+    exposure : 组合级敞口序列（见 timing.build_exposure）。在单票上限施加之后缩放。
     overrides 用于网格搜索这类需要临时改参的场景。
     """
-    weighting = overrides.get("weighting", _cfg_get(cfg, "weighting", "equal"))
+    weighting = overrides.pop("weighting", _cfg_get(cfg, "weighting", "equal"))
     if weighting == "inv_vol" and vol is None and prices is not None:
         vol = realized_vol(prices, _cfg_get(cfg, "vol_lookback", 60))
 
@@ -287,7 +334,12 @@ def weights_from_args(score: pd.DataFrame, cfg, can_buy=None, can_sell=None,
         weight_cap=weight_cap,
     )
     kw.update(overrides)
-    return factor_weights(score, **kw)
+    weights = factor_weights(score, **kw)
+
+    if exposure is not None:
+        exposure = align_exposure(exposure, weights.index, kw["freq"],
+                                 mode=_cfg_get(cfg, "timing_update", "rebalance"))
+    return apply_exposure(weights, exposure)
 
 
 

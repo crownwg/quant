@@ -41,7 +41,8 @@ def grid_search(prices_all: pd.DataFrame, open_all: pd.DataFrame,
                 can_buy, can_sell, args,
                 lookbacks: list[int], top_ns: list[int], buffers: list[int],
                 start_ts: pd.Timestamp, benchmark_curve: pd.Series | None = None,
-                weight_cap: pd.DataFrame | None = None) -> pd.DataFrame:
+                weight_cap: pd.DataFrame | None = None,
+                exposure: pd.Series | None = None) -> pd.DataFrame:
     """对每组合回测，返回结果 DataFrame（一行一组合）。
 
     ⚠️ 这是**全样本网格搜索**：在整段样本上挑最优参数，等于「事后选参」，
@@ -55,7 +56,7 @@ def grid_search(prices_all: pd.DataFrame, open_all: pd.DataFrame,
         score = factors.momentum(prices_all, lb, args.skip_recent)
         weights_all = weights_from_args(score, args, can_buy=can_buy, can_sell=can_sell,
                                         prices=prices_all, weight_cap=weight_cap,
-                                        top_n=tn, buffer=buf)
+                                        exposure=exposure, top_n=tn, buffer=buf)
         keep = weights_all.index >= start_ts
         prices = prices_all.loc[keep]
         weights = weights_all.loc[keep]
@@ -140,6 +141,7 @@ def walk_forward_search(prices_all: pd.DataFrame, open_all: pd.DataFrame,
                         start_ts: pd.Timestamp, train_years: float = 2.0,
                         test_years: float = 0.5, weight_cap: pd.DataFrame | None = None,
                         select_metric: str = "sharpe",
+                        exposure: pd.Series | None = None,
                         periods_per_year: int = 252) -> dict:
     """滚动训练/测试的样本外验证。
 
@@ -178,6 +180,7 @@ def walk_forward_search(prices_all: pd.DataFrame, open_all: pd.DataFrame,
             can_sell=(can_sell.iloc[:end_pos] if can_sell is not None else None),
             prices=prices_all.iloc[:end_pos],
             weight_cap=(weight_cap.iloc[:end_pos] if weight_cap is not None else None),
+            exposure=(exposure.iloc[:end_pos] if exposure is not None else None),
             top_n=tn, buffer=buf)
         w = w.iloc[lo:hi]
         p = prices_all.iloc[lo:hi]
