@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>回撤熔断 · 实测结论</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, "Microsoft YaHei", "PingFang SC", sans-serif;
+    background: #f7f8fa; color: #1f2329; margin: 0; padding: 32px 20px; line-height: 1.7;
+  }
+  .wrap { max-width: 860px; margin: 0 auto; }
+  h1 { font-size: 24px; margin: 0 0 6px; }
+  .sub { color: #8a9099; font-size: 13px; margin-bottom: 28px; }
+  .card {
+    background: #fff; border: 1px solid #e6e8eb; border-radius: 10px;
+    padding: 20px 22px; margin-bottom: 18px;
+  }
+  h2 { font-size: 17px; margin: 0 0 12px; padding-left: 10px; border-left: 3px solid #f5a623; }
+  h3 { font-size: 14px; margin: 18px 0 8px; color: #4a5058; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; margin: 10px 0; }
+  th, td { padding: 9px 10px; text-align: left; border-bottom: 1px solid #edeff2; }
+  th { background: #fafbfc; font-weight: 600; color: #5a6169; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .red { color: #d93025; font-weight: 600; }   /* 涨 */
+  .green { color: #0f9d58; font-weight: 600; } /* 跌 */
+  .verdict {
+    background: #fff8e6; border: 1px solid #f5d99a; border-radius: 8px;
+    padding: 14px 16px; margin: 14px 0; font-size: 14px;
+  }
+  .danger { background: #fdecea; border-color: #f5b7b1; }
+  code {
+    background: #f2f4f7; padding: 2px 6px; border-radius: 4px;
+    font-family: Consolas, Monaco, monospace; font-size: 12.5px;
+  }
+  pre {
+    background: #2b3038; color: #e6e9ef; padding: 14px 16px; border-radius: 8px;
+    overflow-x: auto; font-size: 12.5px; line-height: 1.6;
+  }
+  pre code { background: none; color: inherit; padding: 0; }
+  ul { margin: 8px 0; padding-left: 20px; }
+  li { margin: 5px 0; font-size: 14px; }
+  .kicker { font-size: 13px; color: #6a7078; margin: 0 0 10px; }
+  .split { display: flex; gap: 14px; flex-wrap: wrap; }
+  .split > div { flex: 1 1 240px; border: 1px solid #edeff2; border-radius: 8px; padding: 12px 14px; }
+  .split .t { font-size: 12px; color: #8a9099; margin-bottom: 6px; }
+  .split .v { font-size: 20px; font-weight: 600; }
+  .foot { color: #8a9099; font-size: 12px; margin-top: 24px; border-top: 1px solid #e6e8eb; padding-top: 14px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>回撤熔断 · 实测结论</h1>
+  <div class="sub">工程机械池 6 只 · 反转 20 日 · 每次持 3 只 · 2020-01 ~ 2026-09　生成于 2026-09-14</div>
+
+  <div class="card">
+    <h2>一句话结论</h2>
+    <div class="verdict danger">
+      <b>机制是好的（真能压回撤），但参数不可迁移，别照抄。</b><br>
+      训练段 20 组熔断里 16 组跑赢基线，换到没见过的验证段后 <b>0 组跑赢</b>。
+      训练段的排名和验证段<b>零相关</b>。
+    </div>
+    <p class="kicker">要用的话：阈值别低于 25%，并且必须先在没见过的时间段上验证过。</p>
+  </div>
+
+  <div class="card">
+    <h2>训练段 vs 验证段</h2>
+    <p class="kicker">同一套参数，先在前 4 年挑，再拿到后 2.5 年（完全没参与挑选）去验。</p>
+    <table>
+      <thead><tr>
+        <th>配置（括号里是训练段排名）</th>
+        <th class="num">训练段夏普</th>
+        <th class="num">验证段收益</th>
+        <th class="num">验证段回撤</th>
+        <th class="num">验证段触发</th>
+      </tr></thead>
+      <tbody>
+        <tr><td>基线（不熔断）</td><td class="num">0.08</td><td class="num red">+56.9%</td><td class="num">−27.0%</td><td class="num">—</td></tr>
+        <tr><td>跌 30% / 清仓 / 反弹 10%（#1）</td><td class="num">0.38</td><td class="num red">+56.9%</td><td class="num">−27.0%</td><td class="num">0%</td></tr>
+        <tr><td>跌 25% / 清仓 / 反弹 20%（#2）</td><td class="num">0.38</td><td class="num red">+29.3%</td><td class="num">−33.0%</td><td class="num">4%</td></tr>
+        <tr><td>跌 30% / 清仓 / 反弹 20%（#3）</td><td class="num">0.26</td><td class="num red">+56.9%</td><td class="num">−27.0%</td><td class="num">0%</td></tr>
+        <tr><td>跌 30% / 半仓 / 反弹 10%（#7）</td><td class="num">0.23</td><td class="num red">+56.9%</td><td class="num">−27.0%</td><td class="num">0%</td></tr>
+        <tr><td>跌 40% / 清仓 / 反弹 20%（#19）</td><td class="num">0.00</td><td class="num red">+56.9%</td><td class="num">−27.0%</td><td class="num">0%</td></tr>
+        <tr><td>跌 15% / 清仓 / 反弹 20%（#20，垫底）</td><td class="num">−0.01</td><td class="num green">−6.0%</td><td class="num">−36.4%</td><td class="num">31%</td></tr>
+      </tbody>
+    </table>
+    <div class="verdict">
+      6 组里 5 组在验证段<b>压根没触发</b>（结果与基线逐位相同，等于白交参数复杂度）。<br>
+      唯一触发的那组，恰恰是训练段的<b>最后一名</b>：<span class="green">−6.0%</span>
+      对基线 <span class="red">+56.9%</span>，差 63 个百分点。
+    </div>
+    <div class="split">
+      <div><div class="t">训练段 2020–2023（大跌段）</div><div class="v green">−10.9%</div><div class="t">回撤 −67.4% · 20 组里 16 组跑赢</div></div>
+      <div><div class="t">验证段 2024–2026（上涨段）</div><div class="v red">+56.9%</div><div class="t">回撤 −27.0% · 0 组跑赢</div></div>
+    </div>
+    <p class="kicker" style="margin-top:12px">
+      训练段是大跌段，任何减仓都显得有用；换成上涨段，熔断要么不触发、要么触发了就坏事。
+      <b>「跑赢基线」这个结果本身是行情给的，不是熔断给的。</b>
+    </p>
+  </div>
+
+  <div class="card">
+    <h2>它和择时不是一回事</h2>
+    <table>
+      <thead><tr><th></th><th>择时（timing）</th><th>回撤熔断（dd-brake）</th></tr></thead>
+      <tbody>
+        <tr><td>看什么</td><td>市场趋势好不好</td><td>我自己亏了多少</td></tr>
+        <tr><td>要不要预测能力</td><td>要</td><td>不要，亏到线一定会触发</td></tr>
+        <tr><td>能否叠加</td><td colspan="2">能，两者敞口相乘</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <h2>实现时踩的三个坑（已修，有测试锁着）</h2>
+    <p class="kicker">这类「状态机 + 路径依赖」逻辑写错了不报错，只表现为「净值怎么一直平的」。</p>
+    <h3>1. 清仓后净值冻结 → 永久空仓</h3>
+    <p>降到 0 仓后组合净值不再变化，回撤永远停在触发点，恢复条件永远不成立。
+       实测「跌 10% 清仓」1623 天里熔断了 <b>1606 天</b>，收益 −13%。
+       → 恢复要看<b>影子净值</b>（不熔断会走成什么样），不能看自己那个冻结的净值。</p>
+    <h3>2. 恢复判据不能是「距历史高点还有多远」</h3>
+    <p>这个池子 6 年跌 67%，影子净值相对历史高点永远回不来，等于还是永不恢复。
+       → 改成「从熔断后的低点反弹了多少」。</p>
+    <h3>3. 恢复后立刻再次触发</h3>
+    <p>清仓期间净值冻结在 −30%，不重置高点基准的话，恢复完第二天马上又被打回熔断，
+       恢复只维持一天。→ 每次熔断后重新起算观察起点。</p>
+    <p class="kicker">根因还有一层：「是否触发」只能在<b>未熔断</b>时检查，
+       否则清仓后它恒成立、恢复分支永远走不到。</p>
+  </div>
+
+  <div class="card">
+    <h2>怎么用</h2>
+    <h3>命令行</h3>
+    <pre><code>--dd-brake 0.30          # 从高点跌 30% 就降仓
+--dd-brake-action 0.0    # 降到多少：0=清仓，0.5=半仓
+--dd-brake-resume 0.15   # 不减仓的话市场从低点反弹多少才回来（默认阈值一半）</code></pre>
+    <h3>网页</h3>
+    <p>左侧「仓位管理 · 择时 / 风险」里，波动率目标下面新增了<b>回撤熔断</b>三个输入框，
+       填百分数即可（填 0 = 关闭）。</p>
+    <p class="kicker">注意：walk-forward 验证不了熔断——每折测试段只有半年、净值从 1.0 重开，
+       最深回撤也够不到 30% 阈值，两次跑出来结果逐位相同。
+       要验证请用<b>时间分割</b>（前几年选参、后几年验证），就像上面这张表做的那样。</p>
+  </div>
+
+  <div class="card">
+    <h2>同一轮顺带做的另外两件事</h2>
+    <h3>一键今日清单</h3>
+    <p>页面「调仓清单」里新增 <b>⚡ 一键今日清单</b>：自动补数据并把基准日对齐到最新交易日，
+       不用再管那个默认 20240909 的结束日期。原来的按钮改名为「用指定日期生成」，
+       留着做历史回放。数据落后今天 7 天以上会单独告警。</p>
+    <h3>自选组合预设</h3>
+    <p>「额外补充代码」下面新增下拉：内置 5 组（老登组合 / 消费白马 / 工程机械 / 白酒 / 金融蓝筹），
+       也能把当前填的存成自己的预设。提示：股票池非空时是<b>取并集</b>，
+       只想跑预设那几只就把股票池清空。</p>
+  </div>
+
+  <div class="foot">
+    全部为历史回放结果，不是预测、不是买卖建议。
+    换标的、换时间段结论可能完全不同——这正是上面这张表想说明的事。
+  </div>
+
+</div>
+</body>
+</html>
