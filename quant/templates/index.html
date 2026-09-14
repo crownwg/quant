@@ -623,6 +623,36 @@
         </div>
       </details>
 
+      <details id="compareBox">
+        <summary>多策略对比 —— 同一池子横向跑 7 个策略</summary>
+
+        <div class="meta">
+          因子评价告诉你「哪些因子有效」，多策略对比告诉你「实际组合后谁更稳」。
+          直接复用 <code>quant.main --compare</code>，can_buy/can_sell、容量、基准口径与命令行一致。
+        </div>
+
+        <div class="field">
+          <label>选策略（多选）</label>
+          <div id="compareChips" class="chips">
+            <label><input type="checkbox" name="cmp" value="momentum_120" checked> 120日动量</label>
+            <label><input type="checkbox" name="cmp" value="momentum_60" checked> 60日动量</label>
+            <label><input type="checkbox" name="cmp" value="reversal_20" checked> 20日反转</label>
+            <label><input type="checkbox" name="cmp" value="low_vol_60" checked> 60日低波动</label>
+            <label><input type="checkbox" name="cmp" value="ma_trend"> 均线趋势</label>
+            <label><input type="checkbox" name="cmp" value="ma_breakout"> 均线突破</label>
+            <label><input type="checkbox" name="cmp" value="combine_mom_lv"> 动量+低波合成</label>
+            <label><input type="checkbox" name="cmp" value="combine_mom_rev"> 动量+反转合成</label>
+          </div>
+        </div>
+
+        <button type="button" class="btn btn-alt" id="compareBtn" onclick="onRunCompare()">📊  对比策略</button>
+
+        <div class="meta">
+          提示：建议与「因子有效性检验」结合看——低 IR 的因子如果单独出现在策略里，
+          即使某段收益高，也不值得重仓。
+        </div>
+      </details>
+
       <div class="field check">
         <input type="checkbox" name="use_open" id="use_open" checked>
         <label for="use_open" style="margin: 0">用次日开盘价成交（避免未来函数）</label>
@@ -1054,6 +1084,104 @@ function fillFactorPreset(names) {
   document.querySelectorAll('input[name=fac]').forEach(el => {
     el.checked = names.includes(el.value);
   });
+}
+
+/* ----------- 多策略对比 ----------- */
+async function onRunCompare() {
+  const f = document.forms.runForm;
+  if (!f.pool.value && !f.codes.value) {
+    alert('请先选「股票池」或填「手动代码」');
+    return;
+  }
+  const strategies = Array.from(document.querySelectorAll('input[name=cmp]:checked'))
+                          .map(el => el.value);
+  if (!strategies.length) {
+    alert('请至少选一个策略');
+    return;
+  }
+
+  $('result').innerHTML = `
+    <div class="loading">
+      <div class="spinner"></div>
+      <div class="params-hint">多策略对比：${escapeHtml(strategies.join('、'))}</div>
+      <div class="hint">每个策略都要跑一次完整回测，耗时 ≈ 策略数 × 5~15 秒。</div>
+    </div>`;
+  $('compareBtn').disabled = true;
+  showOverlay('多策略对比中…',
+    `正在横向跑 ${strategies.length} 个策略，每个都按真实 can_buy/can_sell 约束执行。`);
+
+  const params = {
+    pool: f.pool.value.trim(),
+    codes: f.codes.value.trim(),
+    strategies: strategies.join(','),
+    start: f.start.value,
+    end: f.end.value,
+    top_n: parseInt(f.top_n.value, 10) || 15,
+    rebalance: f.rebalance.value,
+    buffer: parseInt(f.buffer.value, 10) || 0,
+    use_open: f.use_open.checked,
+    max_weight: parseFloat(f.max_weight?.value || 0) || 0,
+    benchmark: f.benchmark.value,
+    capital: 1000000,
+  };
+
+  try {
+    const resp = await fetch('/api/compare', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(params),
+    });
+    const d = await resp.json();
+    if (d.error) {
+      $('result').innerHTML = `<div class="error">${escapeHtml(d.error)}</div>`;
+      return;
+    }
+    renderCompareResult(d);
+  } catch (err) {
+    $('result').innerHTML = `<div class="error">请求失败: ${escapeHtml(String(err))}</div>`;
+  } finally {
+    hideOverlay();
+    $('compareBtn').disabled = false;
+  }
+}
+
+function renderCompareResult(d) {
+  let html = freshnessBanner();
+  html += `<div class="summary">`;
+  html += `<h3>多策略对比 · ${escapeHtml(d.strategies.length)} 个策略</h3>`;
+
+  html += '<table class="tbl"><thead><tr>';
+  ['策略', '描述', '总收益', '年化', '夏普', '最大回撤', '年化波动', '超额', 'IR'].forEach(h => {
+    html += `<th>${h}</th>`;
+  });
+  html += '</tr></thead><tbody>';
+
+  // 按夏普排序（高→低），便于一眼找最稳
+  const sorted = [...d.rows].sort((a, b) => (b.sharpe ?? -Infinity) - (a.sharpe ?? -Infinity));
+  sorted.forEach((r, idx) => {
+    const hl = idx === 0 ? 'class="hl"' : '';
+    html += `<tr ${hl}>
+      <td><b>${escapeHtml(r.strategy)}</b></td>
+      <td>${escapeHtml(r.description)}</td>
+      <td class="${cls(r.total_return)}">${fmtPct(r.total_return)}</td>
+      <td class="${cls(r.annual_return)}">${fmtPct(r.annual_return)}</td>
+      <td class="${clsHi(r.sharpe, 1)}">${fmtNum(r.sharpe)}</td>
+      <td class="${cls(r.max_drawdown)}">${fmtPct(r.max_drawdown)}</td>
+      <td>${fmtPctPlain(r.annual_volatility)}</td>
+      <td class="${cls(r.excess_return)}">${fmtPct(r.excess_return)}</td>
+      <td class="${clsHi(r.information_ratio, 0.5)}">${fmtNum(r.information_ratio)}</td>
+    </tr>`;
+  });
+  html += '</tbody></table>';
+
+  html += `<div class="meta" style="margin-top:12px">
+    <b>怎么看：</b>夏普 ≥ 1 通常算稳健；超额 > 0 且 IR ≥ 0.5 表示该策略相对基准有稳定优势。
+    第一行高亮显示的是「按夏普排序」的优胜者，但不等于未来一定最好——建议结合因子评价的 IR 一起看。
+  </div>`;
+
+  html += fileLinks(d);
+  html += '</div>';
+  $('result').innerHTML = html;
 }
 
 function escapeHtml(s) {

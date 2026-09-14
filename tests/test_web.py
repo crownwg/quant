@@ -793,3 +793,58 @@ def test_factor_box_chips_value_matches_backend_supported_factors():
                                        "ma_trend", "ma_breakout", "volume_trend"}}
     assert chips == web._KNOWN_FACTORS, (
         f"前后端因子集合不一致: 差 {chips ^ web._KNOWN_FACTORS}")
+
+
+# --------------------------------------------------- /api/compare
+
+def test_compare_cmd_matches_main_cli_semantics():
+    """多策略对比命令必须带 --compare，且 pool/codes 同时传时 main.py 会取并集。"""
+    cmd = web._build_compare_cmd(
+        web.CompareParams(pool="消费", codes="002557", strategies="momentum_120,low_vol_60",
+                          end="20260910", top_n=15, max_weight=0.1),
+        "px_")
+    assert "--compare" in cmd
+    assert _get(cmd, "--pool") == "消费"
+    assert _get(cmd, "--codes") == "002557"
+    assert _get(cmd, "--compare-strategies") == "momentum_120,low_vol_60"
+    assert _get(cmd, "--max-weight") == "0.1"
+
+
+def test_compare_cmd_default_strategies_is_empty():
+    """策略留空时 main.py 会用默认 7 个；页面不传 --compare-strategies。"""
+    cmd = web._build_compare_cmd(
+        web.CompareParams(pool="消费", strategies=""), "px_")
+    assert "--compare" in cmd
+    assert "--compare-strategies" not in cmd
+
+
+def test_compare_cmd_omits_zero_max_weight():
+    cmd = web._build_compare_cmd(web.CompareParams(pool="消费", max_weight=0.0), "px_")
+    assert "--max-weight" not in cmd
+
+
+def test_compare_route_registered():
+    src = pathlib.Path(web.__file__).read_text(encoding="utf-8")
+    assert '/api/compare' in src
+
+
+def test_compare_box_elements_present():
+    html = _index_html()
+    for el in ('id="compareBox"', 'id="compareChips"', 'id="compareBtn"',
+               'onclick="onRunCompare()"'):
+        assert el in html, f"缺少 {el}"
+
+
+def test_compare_box_handlers_defined():
+    js = _inline_js(_index_html())
+    assert "async function onRunCompare" in js
+    assert "function renderCompareResult" in js
+
+
+def test_compare_box_strategy_values_match_predefined():
+    """前端 chips 的策略名必须与 compare.py 的 PREDEFINED_STRATEGIES 一致。"""
+    from quant import compare
+    chips = set(re.findall(r'value="([a-z0-9_]+)"', _index_html()))
+    chips = {c for c in chips if c in compare.PREDEFINED_STRATEGIES}
+    assert chips == set(compare.PREDEFINED_STRATEGIES), (
+        f"前后端策略集合不一致: 差 {chips ^ set(compare.PREDEFINED_STRATEGIES)}")

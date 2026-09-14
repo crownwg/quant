@@ -64,6 +64,24 @@ class RunParams(BaseModel):
     plan_date: str = Field("", description="清单基准日 YYYYMMDD，留空 = 回测区间最后一天")
 
 
+# ----- 多策略对比入参 -----
+class CompareParams(BaseModel):
+    pool: str = Field("", description="股票池（消费/医药/hs300 等）")
+    codes: str = Field("", description="手动代码，逗号分隔；与股票池取并集")
+    strategies: str = Field(
+        "momentum_120,reversal_20,low_vol_60",
+        description="对比策略列表，逗号分隔；留空用 main.py 默认的 7 个")
+    start: str = Field("20200101")
+    end: str = Field("20240909")
+    top_n: int = Field(15)
+    rebalance: str = Field("M")
+    buffer: int = Field(0)
+    use_open: bool = Field(True)
+    max_weight: float = Field(0.0)
+    benchmark: str = Field("sh000300")
+    capital: float = Field(1_000_000.0)
+
+
 # ----- 因子评价（IC / IR）入参 -----
 # 与 RunParams 分开：因为 IC 评估需要「因子名 + 因子专属窗口」，
 # 而回测只需要「单因子名 + 通用窗口」。让用户在页面上直观地选多个因子诊断。
@@ -246,6 +264,35 @@ def _build_cmd(p: RunParams, prefix: str, plan_only: bool = False,
         if (p.plan_date or "").strip():
             cmd += ["--today", p.plan_date.strip()]
 
+    return cmd
+
+
+def _build_compare_cmd(p: CompareParams, prefix: str) -> list[str]:
+    """把「多策略对比」表单翻译成 `python -m quant.main --compare ...` 的命令行。"""
+    cmd = [
+        str(PYTHON), "-m", "quant.main",
+        "--start", p.start,
+        "--end", p.end,
+        "--top-n", str(p.top_n),
+        "--rebalance", p.rebalance,
+        "--buffer", str(p.buffer),
+        "--benchmark", p.benchmark,
+        "--out-prefix", prefix,
+        "--compare",
+    ]
+    if p.use_open:
+        cmd.append("--use-open")
+    if p.pool.strip():
+        cmd += ["--pool", p.pool.strip()]
+    if p.codes.strip():
+        cmd += ["--codes", p.codes.strip()]
+    # strategies 留空时让 main.py 使用默认 7 个策略；页面如果全清空也走默认。
+    if p.strategies.strip():
+        cmd += ["--compare-strategies", p.strategies.strip()]
+    if p.max_weight > 0:
+        cmd += ["--max-weight", str(p.max_weight)]
+    if p.capital > 0:
+        cmd += ["--capital", str(int(p.capital))]
     return cmd
 
 
@@ -602,6 +649,79 @@ async def factor_eval(p: FactorEvalParams) -> dict:
         "n_periods": next((s["n"] for s in [r["summary"] for r in results] if s["n"]), 0),
         "summary": summary,
         "warning": load_warning,
+    }
+
+
+# ----- 多策略对比 -----
+@app.post("/api/compare")
+async def run_compare(p: CompareParams) -> dict:
+    """同一池子横向跑多个预定义策略，输出对比报告与排序表。
+
+    直接复用 `python -m quant.main --compare`：它内部已经处理好
+    can_buy/can_sell、容量、基准、成本等约束，口径与命令行逐位一致。
+    """
+    if not PYTHON.exists():
+        raise HTTPException(500, f"找不到 venv 解释器: {PYTHON}")
+    if not p.pool.strip() and not p.codes.strip():
+        raise HTTPException(400, "必须填写「股票池」或「手动代码」其中之一")
+
+    prefix = f"web_{uuid.uuid4().hex[:8]}_"
+    cmd = _build_compare_cmd(p, prefix)
+
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=1800, cwd=str(ROOT),
+            encoding="utf-8", errors="replace",
+        )
+    except subprocess.TimeoutExpired:
+        return {"error": "多策略对比超时（>30 分钟），请缩短区间或缩小池子。"}
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"启动失败: {exc}"}
+
+    if proc.returncode != 0:
+        tail = (proc.stderr or proc.stdout or "").strip()[-1500:]
+        return {"error": f"退出码 {proc.returncode}\n{tail}"}
+
+    try:
+        return _parse_compare_results(prefix, cmd)
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"结果解析失败: {exc}"}
+
+
+def _parse_compare_results(prefix: str, cmd: list | None = None) -> dict:
+    """解析 `quant.main --compare` 生成的 CSV 与 HTML 报告。"""
+    csv_path = ROOT / f"{prefix}compare_results.csv"
+    html_path = ROOT / f"{prefix}compare_report.html"
+
+    if not csv_path.exists():
+        raise FileNotFoundError(f"找不到对比结果 CSV: {csv_path}")
+    if not html_path.exists():
+        raise FileNotFoundError(f"找不到对比报告: {html_path}")
+
+    df = _read_csv_codes(csv_path)  # 复用已有读取函数，不会数字字符串化
+    rows = []
+    for _, r in df.iterrows():
+        rows.append({
+            "strategy": str(r.get("strategy", "")),
+            "description": str(r.get("description", "")),
+            "total_return": _json_safe(r.get("total_return")),
+            "annual_return": _json_safe(r.get("annual_return")),
+            "sharpe": _json_safe(r.get("sharpe")),
+            "max_drawdown": _json_safe(r.get("max_drawdown")),
+            "annual_volatility": _json_safe(r.get("annual_volatility")),
+            "annual_turnover": _json_safe(r.get("annual_turnover")),
+            "excess_return": _json_safe(r.get("excess_return")),
+            "information_ratio": _json_safe(r.get("information_ratio")),
+        })
+
+    return {
+        "ok": True,
+        "mode": "compare",
+        "report_file": html_path.name,
+        "summary_file": csv_path.name,
+        "strategies": [r["strategy"] for r in rows],
+        "rows": rows,
+        "cmd": cmd,
     }
 
 
