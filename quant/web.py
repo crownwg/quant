@@ -53,6 +53,11 @@ class RunParams(BaseModel):
     vol_target: float = Field(0.0, description="目标年化波动率（如 0.15），0 = 关闭")
     timing_proxy: str = Field("auto", description="当「市场」用的指数，auto = 按股票池自动选")
 
+    # ----- 回撤熔断（与择时不同：择时看市场，熔断看自己亏了多少）-----
+    dd_brake: float = Field(0.0, description="回撤熔断阈值，0 = 关闭")
+    dd_brake_action: float = Field(0.0, description="触发后降到多少仓位")
+    dd_brake_resume: float = Field(0.0, description="反弹多少才恢复；0 = 用阈值的一半")
+
     # ----- 样本外验证 -----
     walk_forward: bool = Field(False, description="跑 walk-forward 样本外验证")
     fw_train: float = Field(2.0, description="训练窗（年）")
@@ -243,6 +248,14 @@ def _build_cmd(p: RunParams, prefix: str, plan_only: bool = False,
     # --- 择时用的「市场」代理指数 ---
     if (p.timing_proxy or "auto").strip() not in ("", "auto"):
         cmd += ["--timing-proxy", p.timing_proxy.strip()]
+
+    # --- 回撤熔断 ---
+    if float(p.dd_brake or 0.0) > 0:
+        cmd += ["--dd-brake", str(float(p.dd_brake)),
+                "--dd-brake-action", str(float(p.dd_brake_action or 0.0))]
+        # resume 留 0 让 CLI 用默认（阈值一半），避免把「未设置」当成 0 传过去
+        if float(p.dd_brake_resume or 0.0) > 0:
+            cmd += ["--dd-brake-resume", str(float(p.dd_brake_resume))]
 
     # --- 样本外验证 ---
     if p.walk_forward:

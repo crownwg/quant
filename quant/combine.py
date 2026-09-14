@@ -24,7 +24,7 @@ import pandas as pd
 import numpy as np
 
 from . import factors, filters, universe, neutralize, timing
-from .backtest import run as backtest_run, cost_kwargs
+from .backtest import run as backtest_run, cost_kwargs, brake_kwargs
 from .data import load_index, load_panel
 from .strategy import factor_weights, weights_from_args
 
@@ -205,7 +205,8 @@ def run_one_pool(pool: str, strategy: str, args, fetch_start: str, start_ts: pd.
 def run_one_backtest(prices, weights, open_prices, adv=None, args=None):
     """简单封装 backtest.run，便于阅读。"""
     if args is not None:
-        return backtest_run(prices, weights, open_prices=open_prices, **cost_kwargs(args, adv=adv))
+        return backtest_run(prices, weights, open_prices=open_prices,
+                         **cost_kwargs(args, adv=adv), **brake_kwargs(args))
     return backtest_run(prices, weights, open_prices=open_prices, adv=adv)
 
 

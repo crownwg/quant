@@ -18,7 +18,7 @@ from __future__ import annotations
 import pandas as pd
 
 from . import factors, rolling
-from .backtest import run as backtest_run, cost_kwargs
+from .backtest import run as backtest_run, cost_kwargs, brake_kwargs
 from .strategy import factor_weights, weights_from_args
 
 
@@ -134,7 +134,7 @@ def run_compare(prices, open_prices, volume, can_buy, can_sell,
         equity, metrics, detail = backtest_run(
             p, w,
             open_prices=o if args.use_open else None,
-            **cost_kwargs(args),
+            **cost_kwargs(args), **brake_kwargs(args),
         )
         # 超额 vs 基准（如果提供）
         if benchmark_curve is not None:

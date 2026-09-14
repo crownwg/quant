@@ -35,7 +35,7 @@ from pathlib import Path
 import pandas as pd
 
 from . import factors, filters, timing
-from .backtest import run as backtest_run, cost_kwargs
+from .backtest import run as backtest_run, cost_kwargs, brake_kwargs
 from .data import load_index, load_panel
 from .rebalance import build_plan
 from .strategy import factor_weights, weights_from_args
@@ -239,6 +239,7 @@ def run_daily(cfg: dict) -> dict:
         prices, w_eval,
         open_prices=open_prices if cfg["use_open"] else None,
         **cost_kwargs(cfg, adv=(adv_all.loc[keep] if adv_all is not None else None)),
+        **brake_kwargs(cfg),
     )
 
     # 基准对比

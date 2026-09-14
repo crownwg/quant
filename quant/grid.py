@@ -27,7 +27,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from .backtest import run, cost_kwargs
+from .backtest import run, cost_kwargs, brake_kwargs
 from .strategy import factor_weights, weights_from_args
 from . import factors, rolling, timing
 
@@ -342,6 +342,9 @@ def grid_search(prices_all: pd.DataFrame, open_all: pd.DataFrame,
                           timing_modes, timing_lookbacks, timing_bands)
     total = len(combos)
     cost = cost_kwargs(args)
+    # 熔断参数并入同一组 kwargs：网格里跑的回测必须和主回测同口径，
+    # 否则网格挑出的参数在开了熔断的实盘上完全是另一回事
+    cost.update(brake_kwargs(args))
     get_exposure = _exposure_getter(proxy, prices_all, args, fallback=exposure,
                                    search_timing=bool(timing_modes))
     score_cache = {lb: factors.momentum(prices_all, lb, args.skip_recent)
@@ -499,6 +502,9 @@ def walk_forward_search(prices_all: pd.DataFrame, open_all: pd.DataFrame,
     get_exposure = _exposure_getter(proxy, prices_all, args, fallback=exposure,
                                    search_timing=search_timing)
     cost = cost_kwargs(args)
+    # 熔断参数并入同一组 kwargs：网格里跑的回测必须和主回测同口径，
+    # 否则网格挑出的参数在开了熔断的实盘上完全是另一回事
+    cost.update(brake_kwargs(args))
 
     def build_weights(combo, end_pos):
         """combo 在「只用 < end_pos 的数据」下算出的目标权重（整段前程，便于切片）。"""

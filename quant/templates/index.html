@@ -544,9 +544,30 @@
           <input type="text" name="timing_proxy" value="auto" placeholder="auto，或填 000932">
         </div>
 
+        <div class="meta" style="margin-top:14px">
+          <b>回撤熔断</b>——上面择时看的是「市场好不好」，熔断看的是
+          「<b>我自己亏了多少</b>」，两者不是一回事。
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label>从高点跌多少触发 %（0 = 关闭）</label>
+            <input type="number" name="dd_brake" value="0" min="0" max="90" step="5">
+          </div>
+          <div class="field">
+            <label>触发后降到 % 仓</label>
+            <input type="number" name="dd_brake_action" value="0" min="0" max="100" step="10">
+          </div>
+        </div>
+        <div class="field">
+          <label>反弹多少 % 才恢复（0 = 用阈值一半）</label>
+          <input type="number" name="dd_brake_resume" value="0" min="0" max="50" step="5">
+        </div>
+
         <div class="meta">
           实测：<b>ma</b> 那一类最稳，<b>momentum</b> 那一类跨时间段容易翻车。<br>
-          具体数字（几日均线、几个点滞回）不要照抄，换段时间就不一样。
+          具体数字（几日均线、几个点滞回）不要照抄，换段时间就不一样。<br>
+          <b>熔断也一样别照抄</b>：阈值设太紧会长期空仓，收益反而不如不动。
+          想用的话先跑一次样本外看看。
         </div>
       </details>
 
@@ -916,6 +937,10 @@ function collectParams(f) {
     timing_max_exposure: num('timing_max_exposure', 100) / 100,
     vol_target: num('vol_target', 0) / 100,
     timing_proxy: (f.timing_proxy.value || '').trim() || 'auto',
+    // 回撤熔断（同样填百分数）
+    dd_brake: num('dd_brake', 0) / 100,
+    dd_brake_action: num('dd_brake_action', 0) / 100,
+    dd_brake_resume: num('dd_brake_resume', 0) / 100,
     // 样本外验证
     walk_forward: f.walk_forward.checked,
     fw_train: num('fw_train', 2),

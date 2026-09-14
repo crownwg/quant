@@ -53,7 +53,7 @@ from . import combine
 from . import timing
 from . import neutralize
 from . import factor_eval
-from .backtest import cost_kwargs
+from .backtest import cost_kwargs, brake_kwargs
 from .strategy import apply_exposure
 
 
@@ -531,6 +531,16 @@ def make_parser() -> argparse.ArgumentParser:
                    help="波动率目标的仓位下限，默认 0.2")
     p.add_argument("--vol-cap", type=float, default=1.0,
                    help="波动率目标的仓位上限，默认 1.0（不加杠杆）")
+
+    # 回撤熔断：与择时看「市场」不同，它看「自己亏了多少」
+    p.add_argument("--dd-brake", type=float, default=0.0,
+                   help="回撤熔断阈值：组合从历史高点跌破该比例就降仓。"
+                        "0.15 = 跌 15%% 触发。0=关闭")
+    p.add_argument("--dd-brake-action", type=float, default=0.0,
+                   help="触发后把仓位降到多少：0=清仓，0.5=半仓。默认 0")
+    p.add_argument("--dd-brake-resume", type=float, default=None,
+                   help="熔断后，不减仓的话市场从低点反弹多少才重新入场（滞回带）。"
+                        "默认取阈值一半；不设滞回带会在阈值附近反复买卖，成本吃掉好处")
 
     # 参数优化（网格搜索）
     p.add_argument("--grid", action="store_true",
@@ -1062,7 +1072,7 @@ def main() -> None:
 
     equity, metrics, detail = run(prices, weights,
                                   open_prices=open_prices if args.use_open else None,
-                                  **cost_kwargs(args))
+                                  **cost_kwargs(args), **brake_kwargs(args))
 
     # ---- 择时仓位统计（并入指标，并作为报告的一条曲线）----
     exposure_eval = None
@@ -1072,7 +1082,9 @@ def main() -> None:
         metrics["avg_exposure"] = es["avg_exposure"]
         metrics["in_market_ratio"] = es["in_market_ratio"]
         metrics["exposure_switches"] = float(es["switches"])
-        detail["exposure"] = exposure_eval
+        # detail 里已有 run() 写入的熔断敞口，实际总敞口是两者相乘。
+        # 直接覆盖会把熔断那一段抹掉，图上就看不出「哪几段是熔断空仓」了。
+        detail["exposure"] = exposure_eval * detail["exposure"]
 
     # ---- 分年度稳健性分解（默认输出）----
     annual = rolling.annual_breakdown(equity, detail)

@@ -970,3 +970,52 @@ def test_run_plan_today_warns_when_data_stale(monkeypatch):
 
     res = asyncio.run(web.run_plan(_p(plan_today=True)))
     assert "today_warning" in res and "20200101" in res["today_warning"]
+
+
+# ----------- 回撤熔断 -----------
+# 熔断与择时是两回事：择时看「市场好不好」，熔断看「自己亏了多少」。
+# 网页上必须能把这两个开关分开传，否则用户没法只开熔断。
+
+def test_dd_brake_cmd_absent_by_default():
+    """默认不传：给 CLI 传一堆 0 参数既没意义也让命令行变长。"""
+    cmd = web._build_cmd(_p(), "px_")
+    assert "--dd-brake" not in cmd
+
+
+def test_dd_brake_cmd_present_when_set():
+    cmd = web._build_cmd(_p(dd_brake=0.3, dd_brake_action=0.0), "px_")
+    assert _get(cmd, "--dd-brake") == "0.3"
+    assert _get(cmd, "--dd-brake-action") == "0.0"
+
+
+def test_dd_brake_cmd_keeps_half_action():
+    cmd = web._build_cmd(_p(dd_brake=0.25, dd_brake_action=0.5), "px_")
+    assert _get(cmd, "--dd-brake-action") == "0.5"
+
+
+def test_dd_brake_resume_omitted_when_zero():
+    """resume 填 0 表示「让 CLI 用默认」，不能真传 0 过去——
+    那会变成「反弹 0% 就恢复」，等于没有滞回带。"""
+    cmd = web._build_cmd(_p(dd_brake=0.3, dd_brake_resume=0.0), "px_")
+    assert "--dd-brake-resume" not in cmd
+
+
+def test_dd_brake_resume_present_when_set():
+    cmd = web._build_cmd(_p(dd_brake=0.3, dd_brake_resume=0.15), "px_")
+    assert _get(cmd, "--dd-brake-resume") == "0.15"
+
+
+def test_dd_brake_ui_fields_present():
+    html = _index_html()
+    for el in ('name="dd_brake"', 'name="dd_brake_action"',
+               'name="dd_brake_resume"'):
+        assert el in html, f"缺少 {el}"
+
+
+def test_dd_brake_collected_as_fraction():
+    """页面填百分数、后端收小数，与择时那几个字段保持同一约定。"""
+    js = _inline_js(_index_html())
+    for line in ("dd_brake: num('dd_brake', 0) / 100",
+                 "dd_brake_action: num('dd_brake_action', 0) / 100",
+                 "dd_brake_resume: num('dd_brake_resume', 0) / 100"):
+        assert line in js, f"缺少 {line}"

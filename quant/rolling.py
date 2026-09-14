@@ -12,7 +12,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from .backtest import run, cost_kwargs
+from .backtest import run, cost_kwargs, brake_kwargs
 from .strategy import factor_weights, weights_from_args
 
 
@@ -85,7 +85,8 @@ def run_rolling(score, prices, open_prices, can_buy, can_sell, args, windows,
         w = weights_from_args(sc, args, can_buy=cb, can_sell=cs, prices=pr,
                               weight_cap=(weight_cap.iloc[s:e] if weight_cap is not None else None),
                               exposure=(exposure.iloc[s:e] if exposure is not None else None))
-        eq, m, _det = run(pr, w, open_prices=op, **cost_kwargs(args))
+        eq, m, _det = run(pr, w, open_prices=op,
+                      **cost_kwargs(args), **brake_kwargs(args))
         eq = eq * prev_end
         prev_end = float(eq.iloc[-1])
         results.append((eq.index[0], eq.index[-1], eq, m))
