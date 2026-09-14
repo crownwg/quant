@@ -499,8 +499,13 @@ def test_frontend_only_calls_registered_api():
     js = _inline_js(html)
     called = set(re.findall(r"fetch\('(/api/[^'`]*)'", js))
     src = (pathlib.Path(web.__file__)).read_text(encoding="utf-8")
-    routes = set(re.findall(r'@app\.(?:get|post)\("(/api/[^"]*)"', src))
-    assert called - routes == set(), f"前端调了未注册的接口: {sorted(called - routes)}"
+    # delete/put 也要收：REST 路由带路径参数（/api/presets/{name}），
+    # 前端是「前缀 + encodeURIComponent(...)」拼出来的，只会提取到前缀。
+    routes = set(re.findall(r'@app\.(?:get|post|delete|put)\("(/api/[^"]*)"', src))
+    # 把 {name} 放宽成任意字符后整体匹配，这样拼接调用也能对上号
+    pats = [re.compile("^" + re.sub(r"\{[^}]+\}", r"[^'\"]*", r) + "$") for r in routes]
+    missing = {c for c in called if not any(p.match(c) for p in pats)}
+    assert missing == set(), f"前端调了未注册的接口: {sorted(missing)}"
 
 
 def test_freshness_ui_elements_present():
@@ -848,3 +853,120 @@ def test_compare_box_strategy_values_match_predefined():
     chips = {c for c in chips if c in compare.PREDEFINED_STRATEGIES}
     assert chips == set(compare.PREDEFINED_STRATEGIES), (
         f"前后端策略集合不一致: 差 {chips ^ set(compare.PREDEFINED_STRATEGIES)}")
+
+
+# ----------- 一键今日清单 -----------
+# 锁的目标：结束日期字段默认是 20240909，用户不改就点清单，拿到的是一份
+# 「假如当时是 2024-09-09 该买什么」的历史回放。一键按钮必须在后端把日期对齐，
+# 不能只在前端改——前端改了用户还能手动改回去，后端对齐才是真保险。
+
+class _FakeProc:
+    """假装回测跑完了：returncode=0 就够，这些用例只关心日期怎么对齐。"""
+    returncode = 0
+    stdout = ""
+    stderr = ""
+
+
+def test_today_plan_button_present():
+    html = _index_html()
+    for el in ('id="todayPlanBtn"', 'onclick="onRunPlan(true)"', 'id="planBtn"'):
+        assert el in html, f"缺少 {el}"
+
+
+def test_onRunPlan_accepts_today_flag():
+    js = _inline_js(_index_html())
+    assert "async function onRunPlan(today)" in js
+    assert "params.plan_today" in js
+
+
+def test_collect_params_plan_today_defaults_false():
+    """默认不能是 true：普通「用指定日期生成」必须尊重用户填的历史日期。"""
+    js = _inline_js(_index_html())
+    assert "plan_today: false" in js
+
+
+def test_latest_cached_date_takes_max(monkeypatch):
+    """取最大值，与页面体检条「数据已更新到 X」同口径，否则两处日期会打架。"""
+    monkeypatch.setattr(web, "cache_freshness", lambda codes: [
+        {"code": "600519", "last": "2026-09-11"},
+        {"code": "000858", "last": "2026-09-05"},   # 停牌者不拖累基准日
+    ])
+    assert web._latest_cached_date(["600519", "000858"]) == "20260911"
+
+
+def test_latest_cached_date_none_without_data(monkeypatch):
+    monkeypatch.setattr(web, "cache_freshness",
+                        lambda codes: [{"code": "600519", "last": None}])
+    assert web._latest_cached_date(["600519"]) is None
+
+
+def test_sync_plan_to_today_returns_latest(monkeypatch):
+    monkeypatch.setattr(web, "_latest_cached_date", lambda codes: "20260911")
+    monkeypatch.setattr(web.subprocess, "run",
+                        lambda *a, **k: _FakeProc())
+    latest, err = web._sync_plan_to_today(_p(), ["600519"])
+    assert err is None and latest == "20260911"
+
+
+def test_sync_plan_to_today_reports_no_data(monkeypatch):
+    monkeypatch.setattr(web, "_latest_cached_date", lambda codes: None)
+    monkeypatch.setattr(web.subprocess, "run",
+                        lambda *a, **k: _FakeProc())
+    latest, err = web._sync_plan_to_today(_p(), ["600519"])
+    assert latest == "" and "没有" in err
+
+
+def test_run_plan_today_aligns_end_and_plan_date(monkeypatch):
+    """plan_today=true 时，end 与 plan_date 都必须被改成数据最新日。"""
+    captured: dict = {}
+
+    def fake_build(p, prefix, plan_only=False, holdings_path=None):
+        captured["end"] = p.end
+        captured["plan_date"] = p.plan_date
+        return ["python", "-m", "quant.main"]
+
+    monkeypatch.setattr(web, "_build_cmd", fake_build)
+    monkeypatch.setattr(web, "_resolve_codes", lambda p: (["600519"], None))
+    monkeypatch.setattr(web, "_materialize_holdings", lambda t, p: ("h.csv", "测试持仓"))
+    monkeypatch.setattr(web, "_latest_cached_date", lambda codes: "20260911")
+    monkeypatch.setattr(web, "_parse_results", lambda prefix, cmd: {})
+    monkeypatch.setattr(web.subprocess, "run", lambda *a, **k: _FakeProc())
+
+    res = asyncio.run(web.run_plan(_p(end="20240909", plan_today=True)))
+    assert captured["end"] == "20260911", captured
+    assert captured["plan_date"] == "20260911", captured
+    assert res.get("auto_today") == "20260911"
+
+
+def test_run_plan_without_today_keeps_user_date(monkeypatch):
+    """不勾一键时必须原样保留用户填的日期，否则历史回放就没法做了。"""
+    captured: dict = {}
+
+    def fake_build(p, prefix, plan_only=False, holdings_path=None):
+        captured["end"] = p.end
+        captured["plan_date"] = p.plan_date
+        return ["python", "-m", "quant.main"]
+
+    monkeypatch.setattr(web, "_build_cmd", fake_build)
+    monkeypatch.setattr(web, "_materialize_holdings", lambda t, p: ("h.csv", "测试持仓"))
+    monkeypatch.setattr(web, "_parse_results", lambda prefix, cmd: {})
+    monkeypatch.setattr(web.subprocess, "run", lambda *a, **k: _FakeProc())
+
+    res = asyncio.run(web.run_plan(_p(end="20240909", plan_date="20231201")))
+    assert captured["end"] == "20240909"
+    assert captured["plan_date"] == "20231201"
+    assert "auto_today" not in res
+
+
+def test_run_plan_today_warns_when_data_stale(monkeypatch):
+    """数据明显落后今天时要点出来，否则用户会以为拿到的是今天的清单。"""
+    monkeypatch.setattr(web, "_build_cmd",
+                        lambda p, prefix, plan_only=False, holdings_path=None: ["py"])
+    monkeypatch.setattr(web, "_resolve_codes", lambda p: (["600519"], None))
+    monkeypatch.setattr(web, "_materialize_holdings", lambda t, p: ("h.csv", "测试持仓"))
+    monkeypatch.setattr(web, "_latest_cached_date", lambda codes: "20200101")
+    monkeypatch.setattr(web, "_parse_results", lambda prefix, cmd: {})
+    monkeypatch.setattr(web.subprocess, "run", lambda *a, **k: _FakeProc())
+
+    res = asyncio.run(web.run_plan(_p(plan_today=True)))
+    assert "today_warning" in res and "20200101" in res["today_warning"]

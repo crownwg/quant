@@ -157,6 +157,12 @@
     transform: none !important;
   }
 
+  /* 自选组合预设：下拉 + 三个小按钮排一行，挤在「补充代码」输入框下面 */
+  .preset-row { display: flex; gap: 6px; margin-top: 8px; align-items: center; }
+  .preset-row select { flex: 1 1 auto; min-width: 0; margin-bottom: 0; }
+  .preset-row .btn-mini { flex: 0 0 auto; }
+  #presetHint { margin-top: 6px; }
+
   /* 数据体检条 */
   .freshbar {
     background: var(--surface-2);
@@ -399,6 +405,21 @@
       <div class="field" id="codesField">
         <label>额外补充代码（可选，与股票池取并集）</label>
         <input type="text" name="codes" id="codes" placeholder="如: 002557（洽洽食品不在任何指数成分股里，只能这样加）">
+
+        <div class="preset-row">
+          <select id="presetSelect" aria-label="自选组合预设">
+            <option value="">— 自选组合预设 —</option>
+          </select>
+          <button type="button" class="btn-mini" id="presetUseBtn"
+                  onclick="onUsePreset()">填入</button>
+          <button type="button" class="btn-mini" id="presetSaveBtn"
+                  onclick="onSavePreset()">存当前</button>
+          <button type="button" class="btn-mini" id="presetDelBtn"
+                  onclick="onDeletePreset()">删除</button>
+        </div>
+        <div class="meta" id="presetHint">
+          把常用的一篮子股票存成预设，下次下拉直接选，不用每次重敲代码。
+        </div>
       </div>
 
       <div class="field">
@@ -574,12 +595,13 @@
           <input type="text" name="plan_date" value="" placeholder="如 20240909">
         </div>
 
-        <button type="button" class="btn btn-alt" id="planBtn" onclick="onRunPlan()">📋  生成调仓清单</button>
+        <button type="button" class="btn" id="todayPlanBtn" onclick="onRunPlan(true)">⚡  一键今日清单</button>
+        <button type="button" class="btn btn-alt" id="planBtn" onclick="onRunPlan()">📋  用指定日期生成</button>
 
         <div class="meta">
-          留空则用项目里的 <b>my_holdings.csv</b>。<br>
-          要拿能用的清单，先把「结束日期」改成<b>最近交易日</b>——
-          清单是按那个日期算的。
+          <b>一键今日清单</b>：自动把数据补到最新、按最新交易日算，你不用管日期。<br>
+          <b>用指定日期</b>：按上面填的「结束日期 / 清单基准日」算，适合做历史回放。<br>
+          持仓留空则用项目里的 <b>my_holdings.csv</b>。
         </div>
       </details>
 
@@ -902,6 +924,7 @@ function collectParams(f) {
     // 调仓清单
     holdings_text: f.holdings_text.value,
     plan_date: (f.plan_date.value || '').trim(),
+    plan_today: false,
   };
 }
 
@@ -910,6 +933,96 @@ function paramsSummary(p) {
   const vpart = p.vol_target > 0 ? ` · 波动目标 ${(p.vol_target * 100).toFixed(0)}%` : '';
   return `${p.pool || p.codes} · ${p.strategy}`
     + ` · lookback=${p.lookback} · top${p.top_n}${tpart}${vpart}`;
+}
+
+/* ----------- 自选组合预设 -----------
+   把常用的一篮子股票存成名字，下次下拉直接选。option 的 value 存代码串、
+   dataset.name 存显示名、dataset.custom 标记能不能删（内置的不行）。 */
+async function loadPresets() {
+  const sel = $('presetSelect');
+  if (!sel) return;
+  try {
+    const resp = await fetch('/api/presets');
+    const d = await resp.json();
+    const cur = sel.value;
+    sel.innerHTML = '<option value="">— 自选组合预设 —</option>';
+    const add = (items, label, isCustom) => {
+      if (!items || !items.length) return;
+      const g = document.createElement('optgroup');
+      g.label = label;
+      items.forEach(it => {
+        const o = document.createElement('option');
+        o.value = it.codes.join(',');
+        o.textContent = `${it.name}（${it.n} 只）`;
+        o.dataset.name = it.name;
+        o.dataset.custom = isCustom ? '1' : '';
+        g.appendChild(o);
+      });
+      sel.appendChild(g);
+    };
+    add(d.builtin, '内置', false);
+    add(d.custom, '我的', true);
+    if (cur) sel.value = cur;
+  } catch (err) {
+    console.warn('预设加载失败', err);
+  }
+}
+
+function onUsePreset() {
+  const sel = $('presetSelect');
+  if (!sel || !sel.value) { alert('先在下拉里选一个组合'); return; }
+  const opt = sel.options[sel.selectedIndex];
+  const name = opt.dataset.name || '';
+  const f = document.forms.runForm;
+  f.codes.value = sel.value;
+  // 并集语义必须点明：pool 非空时实际池子 = 池子 + 预设，
+  // 不提醒的话用户以为「选了老登组合就只跑这 12 只」，其实不是。
+  const poolWarn = f.pool.value.trim()
+    ? `注意：股票池还选着「${f.pool.value.trim()}」，实际是两者取并集；`
+      + '只想跑预设里这些票，就把股票池清空。'
+    : '';
+  $('presetHint').textContent = `已填入「${name}」${sel.value.split(',').length} 只。${poolWarn}`;
+}
+
+async function onSavePreset() {
+  const f = document.forms.runForm;
+  const codes = (f.codes.value || '').trim();
+  if (!codes) { alert('先在「额外补充代码」里填好股票代码，再存成预设'); return; }
+  const name = (prompt('给这个组合起个名字（如：老登组合）', '') || '').trim();
+  if (!name) return;
+  try {
+    const resp = await fetch('/api/presets', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, codes }),
+    });
+    const d = await resp.json();
+    if (!resp.ok) { alert('保存失败：' + (d.detail || d.error || resp.status)); return; }
+    await loadPresets();
+    $('presetHint').textContent = `已保存「${name}」，下次在下拉里直接选。`;
+  } catch (err) {
+    alert('保存失败: ' + err);
+  }
+}
+
+async function onDeletePreset() {
+  const sel = $('presetSelect');
+  if (!sel || !sel.value) { alert('先选一个要删除的组合'); return; }
+  const opt = sel.options[sel.selectedIndex];
+  const name = opt.dataset.name || '';
+  if (!opt.dataset.custom) { alert('内置预设不能删除'); return; }
+  if (!confirm(`删除预设「${name}」？`)) return;
+  try {
+    const resp = await fetch('/api/presets/' + encodeURIComponent(name), {
+      method: 'DELETE',
+    });
+    const d = await resp.json();
+    if (!resp.ok) { alert('删除失败：' + (d.detail || d.error || resp.status)); return; }
+    await loadPresets();
+    $('presetHint').textContent = `已删除「${name}」。`;
+  } catch (err) {
+    alert('删除失败: ' + err);
+  }
 }
 
 async function onSubmit(e) {
@@ -956,25 +1069,35 @@ async function onSubmit(e) {
   return false;
 }
 
-/* ----------- 生成调仓清单（独立入口） ----------- */
-async function onRunPlan() {
+/* ----------- 生成调仓清单（独立入口） -----------
+   today=true 走「一键今日清单」：后端会先补数据再把基准日对齐到数据最新交易日，
+   这样用户完全不用碰那个默认 20240909 的结束日期字段。 */
+async function onRunPlan(today) {
   const f = document.forms.runForm;
   const params = collectParams(f);
   if (!params.pool && !params.codes) { alert('请先选「股票池」或填「手动代码」'); return; }
+  params.plan_today = !!today;
 
   const srcHint = params.holdings_text.trim()
     ? '页面填写的持仓' : '项目自带的 my_holdings.csv';
+  const dateHint = today ? '自动对齐到数据最新交易日'
+    : (params.plan_date || '结束日期 ' + params.end);
   $('result').innerHTML = `
     <div class="loading">
       <div class="spinner"></div>
-      <div class="params-hint">生成调仓清单：${escapeHtml(paramsSummary(params))}</div>
-      <div class="hint">持仓来源：${escapeHtml(srcHint)} ·
-        基准日：${escapeHtml(params.plan_date || '结束日期 ' + params.end)}</div>
+      <div class="params-hint">${today ? '一键今日清单' : '生成调仓清单'}：${escapeHtml(paramsSummary(params))}</div>
+      <div class="hint">持仓来源：${escapeHtml(srcHint)} · 基准日：${escapeHtml(dateHint)}</div>
     </div>`;
-  $('planBtn').disabled = true;
-  $('planBtn').textContent = '⏳ 生成中...';
-  showOverlay('生成调仓清单中…',
-    '正在按当前持仓算出该买/该卖多少股，请勿关闭页面。');
+
+  // 两个按钮都要锁：一键模式跑得久（含补数据），中途再点会起第二个回测进程。
+  const btns = [$('planBtn'), $('todayPlanBtn')].filter(Boolean);
+  btns.forEach(b => { b.disabled = true; });
+  if (today && $('todayPlanBtn')) $('todayPlanBtn').textContent = '⏳ 更新数据并生成...';
+  else $('planBtn').textContent = '⏳ 生成中...';
+  showOverlay(today ? '一键生成今日清单…' : '生成调仓清单中…',
+    today ? '先把数据补到最新，再按当前持仓算出该买/该卖多少股。'
+          + '比平时慢一些（要连网更新），请勿关闭页面。'
+          : '正在按当前持仓算出该买/该卖多少股，请勿关闭页面。');
 
   try {
     const resp = await fetch('/api/plan', {
@@ -992,8 +1115,9 @@ async function onRunPlan() {
     $('result').innerHTML = `<div class="error">请求失败: ${escapeHtml(String(err))}</div>`;
   } finally {
     hideOverlay();
-    $('planBtn').disabled = false;
-    $('planBtn').textContent = '📋  生成调仓清单';
+    btns.forEach(b => { b.disabled = false; });
+    $('planBtn').textContent = '📋  用指定日期生成';
+    if ($('todayPlanBtn')) $('todayPlanBtn').textContent = '⚡  一键今日清单';
   }
 }
 
@@ -1303,13 +1427,17 @@ function renderPlan(d) {
   const sum = arr => arr.reduce((a, r) => a + (Number(r.amount) || 0), 0);
 
   let html = freshnessBanner();
+  if (d.today_warning) {
+    html += `<div class="databanner">⚠️ ${escapeHtml(d.today_warning)}</div>`;
+  }
   if (!rows.length) {
     html += `<div class="verdict">清单是空的。<br/>
       常见原因：基准日<b>不是调仓日</b>，或者当前持仓已经和目标一致。<br/>
-      把「结束日期」改成最近交易日，或点左侧「用最新数据」，再生成一次。</div>`;
+      ${d.auto_today ? '' : '想要今天的清单，直接点左边「⚡ 一键今日清单」，'
+                            + '它会自动把日期对齐到数据最新交易日。'}</div>`;
   } else {
     html += `<div class="verdict">
-      基准日 <b>${escapeHtml(d.plan_date || '-')}</b> · 持仓来源：${escapeHtml(d.holding_source || '-')}<br/>
+      基准日 <b>${escapeHtml(d.plan_date || '-')}</b>${d.auto_today ? '（已自动对齐到数据最新交易日）' : ''} · 持仓来源：${escapeHtml(d.holding_source || '-')}<br/>
       要<b>买入</b> ${buys.length} 笔、合计 <b>${fmtMoney(sum(buys))}</b> 元；
       要<b>卖出</b> ${sells.length} 笔、合计 <b>${fmtMoney(sum(sells))}</b> 元。
     </div>`;
@@ -1628,6 +1756,7 @@ window.addEventListener('resize', () => {
 /* 页面一打开就体检一次：默认结束日是 2024-09-09，让用户第一眼就看见
    「数据其实到 2026-09-10 了」，而不是跑完才发现拿的是历史回放。 */
 checkFreshness();
+loadPresets();
 </script>
 
 </body>

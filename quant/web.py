@@ -11,6 +11,7 @@ import os
 import re
 import subprocess
 import uuid
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -62,6 +63,8 @@ class RunParams(BaseModel):
     holdings_text: str = Field(
         "", description="持仓，每行『代码,股数』；留空则用项目里的 my_holdings.csv")
     plan_date: str = Field("", description="清单基准日 YYYYMMDD，留空 = 回测区间最后一天")
+    plan_today: bool = Field(
+        False, description="一键今日清单：自动把基准日对齐到数据最新交易日")
 
 
 # ----- 多策略对比入参 -----
@@ -478,6 +481,51 @@ async def refresh_data(p: RunParams) -> dict:
     return res
 
 
+def _latest_cached_date(codes: list[str]) -> str | None:
+    """池内本地缓存的最新日期，返回 YYYYMMDD；一张 CSV 都没有则返回 None。
+
+    取最大值而不是最小值：页面数据体检条显示的「数据已更新到 X」也是最大值，
+    两边必须同一个口径，否则用户会看到「数据到 09-11、清单基准日 09-01」这种
+    打架的提示。个别停牌 / 落后者由 main.py 的「无法计算」告警单独兜住
+    （前端 skipped 列表会显示），不该让它把整个基准日拖回过去。
+    """
+    rows = cache_freshness(codes)
+    dated = [str(r["last"]) for r in rows if r["last"]]
+    if not dated:
+        return None
+    return max(dated).replace("-", "")
+
+
+def _sync_plan_to_today(p: RunParams, codes: list[str]) -> tuple[str, str | None]:
+    """一键今日清单：把数据补到最新，并把基准日对齐过去。
+
+    返回 (基准日 YYYYMMDD, 错误信息)。
+    补数据失败不直接放弃——本地已有缓存时照样能出清单，只是可能不够新，
+    所以失败只记下来反映在返回值里，让调用方决定怎么提示。
+    """
+    today = datetime.now().strftime("%Y%m%d")
+    cmd = [str(PYTHON), "-m", "quant.main", "--refresh-data",
+           "--start", p.start or "20200101", "--end", today]
+    if p.pool.strip():
+        cmd += ["--pool", p.pool.strip()]
+    if p.codes.strip():
+        cmd += ["--codes", p.codes.strip()]
+
+    # 用今天当 end 是故意的：refresh 只做增量更新，接口当天没数据也不会报错，
+    # 最多就是「没拉到新的」——而回测用今天会去拉一段未来的区间然后崩。
+    try:
+        subprocess.run(cmd, capture_output=True, text=True, timeout=1800,
+                       cwd=str(ROOT), encoding="utf-8", errors="replace")
+    except Exception:  # noqa: BLE001  网络抖动不该让整个按钮失效
+        pass
+
+    latest = _latest_cached_date(codes)
+    if not latest:
+        return "", ("池内没有任何本地缓存数据，且自动更新也没拉到。"
+                    "请检查网络，或先用命令行跑一次 --refresh-data。")
+    return latest, None
+
+
 @app.post("/api/plan")
 async def run_plan(p: RunParams) -> dict:
     """只生成「今日调仓清单」：按实际持仓算出该买 / 该卖多少股。
@@ -494,6 +542,22 @@ async def run_plan(p: RunParams) -> dict:
     hold_path, hold_src = _materialize_holdings(p.holdings_text, prefix)
     if hold_path is None:
         raise HTTPException(400, "持仓格式无法识别：每行写「代码,股数」，例如 600519,100")
+
+    # ---- 一键今日清单 ----
+    # 不做的代价：结束日期字段默认 20240909，用户不改就点清单，拿到的是一份
+    # 「假如当时是 2024-09-09 该买什么」的历史回放，看着完全像今天的建议。
+    # 所以这里补数据 + 对齐日期一起做掉，用户不必知道有这个字段。
+    auto_today = ""
+    if p.plan_today:
+        codes, cerr = _resolve_codes(p)
+        if cerr:
+            raise HTTPException(400, cerr)
+        latest, err = _sync_plan_to_today(p, codes)
+        if err:
+            return {"error": err}
+        p.plan_date = latest
+        p.end = latest
+        auto_today = latest
 
     cmd = _build_cmd(p, prefix, plan_only=True, holdings_path=hold_path)
 
@@ -527,6 +591,14 @@ async def run_plan(p: RunParams) -> dict:
     res["holding_source"] = hold_src
     res["skipped"] = skipped
     res["plan_date"] = (p.plan_date or "").strip() or "回测区间最后一天"
+    if auto_today:
+        res["auto_today"] = auto_today
+        gap = (datetime.now() - datetime.strptime(auto_today, "%Y%m%d")).days
+        if gap > 7:
+            res["today_warning"] = (
+                f"数据最新只到 {auto_today}，比今天早了 {gap} 天"
+                f"（可能是长假，也可能是自动更新没拉到）。"
+                f"这份清单是按 {auto_today} 的价格算的，不是今天的。")
     return res
 
 
@@ -889,6 +961,41 @@ def _drawdown_series(equity: pd.Series) -> list[float]:
     cummax = equity.cummax()
     dd = (equity / cummax - 1.0).fillna(0.0)
     return dd.astype(float).tolist()
+
+
+# ----- 自选组合预设 -----
+class PresetIn(BaseModel):
+    name: str = Field("", description="预设名")
+    codes: str = Field("", description="股票代码，逗号或空格分隔")
+
+
+def _preset_items(data: dict[str, list[str]]) -> list[dict]:
+    return [{"name": k, "codes": v, "n": len(v)} for k, v in data.items()]
+
+
+@app.get("/api/presets")
+async def list_presets() -> dict:
+    """内置 + 用户自定义的股票组合，供页面下拉直接选。"""
+    from quant import presets
+    return presets.all_presets()
+
+
+@app.post("/api/presets")
+async def save_preset(body: PresetIn) -> dict:
+    from quant import presets
+    data, err = presets.save_custom(body.name, body.codes)
+    if err:
+        raise HTTPException(400, err)
+    return {"ok": True, "name": body.name.strip(), "custom": _preset_items(data)}
+
+
+@app.delete("/api/presets/{name}")
+async def delete_preset(name: str) -> dict:
+    from quant import presets
+    data, err = presets.delete_custom(name)
+    if err:
+        raise HTTPException(404, err)
+    return {"ok": True, "custom": _preset_items(data)}
 
 
 def _compute_monthly(equity_df: pd.DataFrame) -> dict:
