@@ -510,3 +510,286 @@ def test_freshness_ui_elements_present():
                'id="latestBtn"', 'id="refreshBtn"'):
         assert el in html, f"缺少 {el}"
     assert "freshnessBanner" in _inline_js(html)
+
+
+def test_global_overlay_present_and_wired():
+    """全局遮罩（长任务防「卡死」错觉）的元素与控制函数必须在。
+
+    点「运行回测 / 生成调仓清单 / 更新数据」这几十秒的任务时整页盖一层，
+    若元素或函数被误删，页面会静默失效（不报错但遮罩不出来）。
+    """
+    html = _index_html()
+    js = _inline_js(html)
+    for el in ('id="overlay"', 'id="overlayTitle"', 'id="overlaySub"'):
+        assert el in html, f"缺少 {el}"
+    for fn in ("function showOverlay", "function hideOverlay"):
+        assert fn in js, f"缺少 {fn}"
+    # 三个入口都必须接了遮罩：入口调 showOverlay、收尾（finally）调 hideOverlay
+    assert js.count("showOverlay(") >= 3, "需要给三个长任务都接上遮罩"
+    assert js.count("hideOverlay()") >= 3, "finally 里必须都关掉遮罩"
+
+
+# --------------------------------------------------- /api/factor_eval
+
+# 这些测试不调真实接口（接口会拉数据、跑 IC），而是 mock 数据加载与因子构造器，
+# 只验证：参数校验、口径、序列化、报告落盘。用 fixture 建一份人造价格面板
+# （1440 天 × 30 只、随机走势），能让 evaluate_many 在 1 秒内跑完。
+
+def _fake_panel(n_days: int = 1440, n_codes: int = 30, seed: int = 7):
+    """造一个够给 IC 评估用的随机价格/成交量面板。"""
+    rng = np.random.default_rng(seed)
+    dates = pd.bdate_range("2020-01-01", periods=n_days)
+    codes = [f"{600000 + i:06d}" for i in range(n_codes)]
+    # 让 30 只股票有真实差异：每只一个独立的"漂移+随机"序列
+    drift = rng.normal(0, 0.0005, (n_days, n_codes)).cumsum(axis=0)
+    noise = rng.normal(0, 0.015, (n_days, n_days)[0:1]*0 + (n_days, n_codes))
+    noise = noise[:n_days]  # 保证形状一致
+    rets = drift + noise
+    close = pd.DataFrame(100 * np.exp(rets), index=dates, columns=codes)
+    volume = pd.DataFrame(
+        rng.integers(1_000_000, 5_000_000, size=(n_days, n_codes)),
+        index=dates, columns=codes,
+    )
+    return {
+        "close": close,
+        "open": close.copy(),
+        "high": close * 1.01,
+        "low": close * 0.99,
+        "volume": volume,
+        "amount": close * volume,
+        "outstanding_share": pd.DataFrame(
+            rng.integers(1_000_000_000, 5_000_000_000, size=(n_days, n_codes)),
+            index=dates, columns=codes,
+        ),
+    }
+
+
+def test_factor_eval_unknown_factor_rejected():
+    """陌生因子名直接 400-ish 返回：避免 HTML 报告 render 时 KeyError。"""
+    p = web.FactorEvalParams(pool="", codes="600519", factors="momentum,NOT_A_FACTOR")
+    d = asyncio.run(web.factor_eval(p))
+    assert "error" in d and "NOT_A_FACTOR" in d["error"]
+
+
+def test_factor_eval_empty_factor_list_rejected():
+    p = web.FactorEvalParams(pool="", codes="600519", factors="")
+    d = asyncio.run(web.factor_eval(p))
+    assert "error" in d and "至少选一个因子" in d["error"]
+
+
+def test_factor_eval_no_codes_no_pool_rejected():
+    p = web.FactorEvalParams(pool="", codes="", factors="momentum")
+    d = asyncio.run(web.factor_eval(p))
+    assert "error" in d
+
+
+def test_factor_eval_pool_error_is_readable():
+    """池名错要给可读提示，不该抛 500。"""
+    p = web.FactorEvalParams(pool="不存在的池", codes="", factors="momentum")
+    d = asyncio.run(web.factor_eval(p))
+    assert "error" in d and ("股票池" in d["error"] or "未知" in d["error"])
+
+
+def test_factor_eval_codes_padded(monkeypatch, tmp_path):
+    """手动代码不补零（如 858）也要能匹配——与回测入口同口径。"""
+    captured = {}
+    def fake_load_panel(codes, start, end, sleep=1.0, on_error="raise", data_dir="data"):
+        captured["codes"] = list(codes)
+        return _fake_panel(n_codes=len(codes))
+    def fake_eval(factors_dict, prices, n_groups=5, horizons=(1, 5, 10, 20, 60)):
+        # 返回最简的 results（一组只造一项），足以让 summary 序列化
+        return [{
+            "name": "momentum",
+            "summary": {
+                "n": 200, "mean_ic": 0.04, "std_ic": 0.10, "ir": 0.4,
+                "t_stat": 5.66, "positive_ratio": 0.55, "abs_mean_ic": 0.05,
+                "verdict": "有效可用",
+            },
+            "ic_dates": ["2020-01-01"],
+            "ic_values": [0.04],
+            "cum_ic": [0.04],
+            "decay": [{"horizon": 20, "mean_ic": 0.04, "std_ic": 0.10, "ir": 0.4, "positive_ratio": 0.55, "n": 200}],
+            "quantiles": [{"group": 1, "mean_return": 0.0, "annualized": 0.0, "count": 100}],
+            "long_short": 0.005,
+        }]
+    monkeypatch.setattr("quant.data.load_panel", fake_load_panel)
+    monkeypatch.setattr("quant.factor_eval.evaluate_many", fake_eval)
+    # 报告写到 tmp_path 而不是 ROOT，避免污染
+    monkeypatch.setattr(web, "ROOT", tmp_path)
+
+    p = web.FactorEvalParams(pool="", codes="858, 600519", factors="momentum",
+                             start="20210101", end="20240101")
+    d = asyncio.run(web.factor_eval(p))
+    assert "error" not in d
+    # 858 → 000858
+    assert "000858" in captured["codes"] and "600519" in captured["codes"]
+    assert len(captured["codes"]) == 2
+
+
+def test_factor_eval_summary_serializes_to_json_safe(monkeypatch, tmp_path):
+    """summary 各字段必须是 JSON 安全的数（不能是 NaN 字符串）。"""
+    def fake_load_panel(codes, start, end, sleep=1.0, on_error="raise", data_dir="data"):
+        return _fake_panel(n_codes=len(codes))
+    monkeypatch.setattr("quant.data.load_panel", fake_load_panel)
+    monkeypatch.setattr("quant.factor_eval.evaluate_many",
+                        lambda *a, **kw: [{
+                            "name": "momentum",
+                            "summary": {
+                                "n": 100, "mean_ic": float("nan"), "std_ic": 0.1,
+                                "ir": float("nan"), "t_stat": 0.0,
+                                "positive_ratio": 0.5, "abs_mean_ic": 0.05,
+                                "verdict": "样本不足",
+                            },
+                            "ic_dates": [], "ic_values": [], "cum_ic": [],
+                            "decay": [], "quantiles": [],
+                            "long_short": 0.0,
+                        }])
+    monkeypatch.setattr(web, "ROOT", tmp_path)
+
+    p = web.FactorEvalParams(pool="", codes="600519", factors="momentum",
+                             start="20210101", end="20240101")
+    d = asyncio.run(web.factor_eval(p))
+    s = d["summary"][0]
+    # NaN 必须变 None，否则 JSON 序列化失败
+    assert s["mean_ic"] is None and s["ir"] is None
+
+
+def test_factor_eval_writes_html_report(monkeypatch, tmp_path):
+    """报告 HTML 必须落盘（前端才能打开）。"""
+    def fake_load_panel(codes, start, end, sleep=1.0, on_error="raise", data_dir="data"):
+        return _fake_panel(n_codes=len(codes))
+    monkeypatch.setattr("quant.data.load_panel", fake_load_panel)
+    monkeypatch.setattr("quant.factor_eval.evaluate_many",
+                        lambda *a, **kw: [{
+                            "name": "momentum",
+                            "summary": {"n": 100, "mean_ic": 0.04, "std_ic": 0.1,
+                                        "ir": 0.4, "t_stat": 5.66, "positive_ratio": 0.55,
+                                        "abs_mean_ic": 0.05, "verdict": "有效可用"},
+                            "ic_dates": ["2020-01-01"], "ic_values": [0.04],
+                            "cum_ic": [0.04],
+                            "decay": [{"horizon": 20, "mean_ic": 0.04, "std_ic": 0.1,
+                                       "ir": 0.4, "positive_ratio": 0.55, "n": 100}],
+                            "quantiles": [{"group": 1, "mean_return": 0.0,
+                                           "annualized": 0.0, "count": 100}],
+                            "long_short": 0.005,
+                        }])
+    monkeypatch.setattr(web, "ROOT", tmp_path)
+
+    p = web.FactorEvalParams(pool="消费", codes="", factors="momentum",
+                             start="20210101", end="20240101")
+    d = asyncio.run(web.factor_eval(p))
+    assert d["ok"] is True
+    report_path = tmp_path / d["report"]
+    assert report_path.exists(), "报告 HTML 未落盘"
+    text = report_path.read_text(encoding="utf-8")
+    # 模板三件套：累计 IC / 衰减 / 分组收益
+    assert "cumic" in text and "decay" in text
+    # 数据真的嵌进去了（不是 __DATA__ 占位符）
+    assert "__DATA__" not in text
+    # 数据体里有这个因子名
+    assert "momentum" in text
+
+
+def test_factor_eval_reports_load_warning(monkeypatch, tmp_path):
+    """部分代码拉不到数据时给 warning（不挡报告），返回字段。"""
+    def fake_load_panel(codes, start, end, sleep=1.0, on_error="raise", data_dir="data"):
+        # 只返回 2 只，故意丢几只
+        return _fake_panel(n_codes=2)
+    monkeypatch.setattr("quant.data.load_panel", fake_load_panel)
+    monkeypatch.setattr("quant.factor_eval.evaluate_many",
+                        lambda *a, **kw: [{
+                            "name": "momentum",
+                            "summary": {"n": 100, "mean_ic": 0.04, "std_ic": 0.1,
+                                        "ir": 0.4, "t_stat": 5.66, "positive_ratio": 0.55,
+                                        "abs_mean_ic": 0.05, "verdict": "有效可用"},
+                            "ic_dates": ["2020-01-01"], "ic_values": [0.04], "cum_ic": [0.04],
+                            "decay": [], "quantiles": [], "long_short": 0.005,
+                        }])
+    monkeypatch.setattr(web, "ROOT", tmp_path)
+
+    p = web.FactorEvalParams(pool="", codes="000858,000596,000001", factors="momentum",
+                             start="20210101", end="20240101")
+    d = asyncio.run(web.factor_eval(p))
+    assert d["ok"] is True
+    assert "已过滤" in d["warning"]
+    assert "n_codes" in d and d["n_codes"] == 2
+
+
+# --------------------------------------------------- 因子评价 UI 元素
+
+def test_factor_box_elements_present():
+    """因子评价入口元素必须在：折叠面板、chips、按钮、horizon/groups 输入。"""
+    html = _index_html()
+    for el in ('id="factorBox"', 'id="factorChips"', 'id="feBtn"',
+               'id="fe_horizon"', 'id="fe_groups"', 'onclick="onFactorEval()"'):
+        assert el in html, f"缺少 {el}"
+
+
+def test_factor_box_handlers_defined():
+    js = _inline_js(_index_html())
+    assert "async function onFactorEval" in js
+    assert "function renderFactorResult" in js
+
+
+def test_factor_box_chips_have_options():
+    """chips 里 6 个因子 checkbox 必须全在，值与 FACTOR_BUILDERS 对齐。"""
+    html = _index_html()
+    chips = re.findall(r'value="([a-z_]+)"', html)
+    expected = {"momentum", "reversal", "low_volatility", "ma_trend", "ma_breakout", "volume_trend"}
+    found = {c for c in chips if c in expected}
+    assert found == expected, f"chips 因子不全: 缺 {expected - found}，多 {found - expected}"
+
+
+def test_factor_eval_route_registered_in_backend():
+    src = (pathlib.Path(web.__file__)).read_text(encoding="utf-8")
+    assert '/api/factor_eval' in src, "后端没注册 /api/factor_eval"
+
+
+def test_factor_box_chips_value_matches_backend_supported_factors():
+    """前端 chips 的 value 必须与后端 _KNOWN_FACTORS 严格一致，
+    否则用户勾的因子到后端会被 'NOT_A_FACTOR' 拒掉。"""
+    chips = set(re.findall(r'value="([a-z_]+)"', _index_html()))
+    chips = {c for c in chips if c in {"momentum", "reversal", "low_volatility",
+                                       "ma_trend", "ma_breakout", "volume_trend"}}
+    assert chips == web._KNOWN_FACTORS, (
+        f"前后端因子集合不一致: 差 {chips ^ web._KNOWN_FACTORS}")
+
+
+# --------------------------------------------------- 因子评价 UI 元素
+
+def test_factor_box_elements_present():
+    """因子评价入口元素必须在：折叠面板、chips、按钮、horizon/groups 输入。"""
+    html = _index_html()
+    for el in ('id="factorBox"', 'id="factorChips"', 'id="feBtn"',
+               'id="fe_horizon"', 'id="fe_groups"', 'onclick="onFactorEval()"'):
+        assert el in html, f"缺少 {el}"
+
+
+def test_factor_box_handlers_defined():
+    js = _inline_js(_index_html())
+    assert "async function onFactorEval" in js
+    assert "function renderFactorResult" in js
+
+
+def test_factor_box_chips_have_options():
+    """chips 里 6 个因子 checkbox 必须全在，值与 FACTOR_BUILDERS 对齐。"""
+    html = _index_html()
+    chips = re.findall(r'value="([a-z_]+)"', html)
+    expected = {"momentum", "reversal", "low_volatility", "ma_trend", "ma_breakout", "volume_trend"}
+    found = {c for c in chips if c in expected}
+    assert found == expected, f"chips 因子不全: 缺 {expected - found}，多 {found - expected}"
+
+
+def test_factor_eval_route_registered_in_backend():
+    src = (pathlib.Path(web.__file__)).read_text(encoding="utf-8")
+    assert '/api/factor_eval' in src, "后端没注册 /api/factor_eval"
+
+
+def test_factor_box_chips_value_matches_backend_supported_factors():
+    """前端 chips 的 value 必须与后端 _KNOWN_FACTORS 严格一致，
+    否则用户勾的因子到后端会被 'NOT_A_FACTOR' 拒掉。"""
+    chips = set(re.findall(r'value="([a-z_]+)"', _index_html()))
+    chips = {c for c in chips if c in {"momentum", "reversal", "low_volatility",
+                                       "ma_trend", "ma_breakout", "volume_trend"}}
+    assert chips == web._KNOWN_FACTORS, (
+        f"前后端因子集合不一致: 差 {chips ^ web._KNOWN_FACTORS}")

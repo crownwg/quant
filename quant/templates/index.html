@@ -119,6 +119,37 @@
     margin-bottom: 10px;
   }
   .btn-alt:hover:not(:disabled) { border-color: var(--accent); box-shadow: none; }
+  /* 因子多选 chips */
+  .chips { display: flex; flex-wrap: wrap; gap: 6px 12px; }
+  .chips label {
+    display: inline-flex; align-items: center; gap: 4px;
+    padding: 4px 10px; border-radius: 14px;
+    background: var(--surface-2); border: 1px solid var(--border);
+    font-size: 13px; cursor: pointer; user-select: none;
+  }
+  .chips label:has(input:checked) {
+    border-color: var(--accent); background: rgba(99, 145, 255, 0.10);
+    color: var(--text);
+  }
+  .chips input[type=checkbox] { margin: 0; }
+  /* 因子 IC/IR 摘要 */
+  .ic-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px; }
+  .ic-card {
+    background: var(--surface-2); border: 1px solid var(--border);
+    border-radius: 10px; padding: 12px 14px;
+  }
+  .ic-card .nm { font-size: 13px; color: var(--muted); margin-bottom: 4px; }
+  .ic-card .ir { font-size: 22px; font-weight: 600; font-family: var(--mono, monospace); }
+  .ic-card .ir.bad { color: #ff7875; }   /* IR < 0.3 警告色 */
+  .ic-card .ir.good { color: #16c060; }  /* IR > 0.5 鼓励色 */
+  .ic-card .verdict {
+    display: inline-block; margin-top: 8px;
+    font-size: 11px; padding: 2px 8px; border-radius: 10px;
+    background: rgba(255,255,255,0.05); color: var(--muted);
+  }
+  .ic-card .verdict.good { background: rgba(22, 192, 96, 0.13); color: #6dd29c; }
+  .ic-card .verdict.bad  { background: rgba(255, 120, 117, 0.13); color: #ffa39e; }
+  .ic-card .meta2 { font-size: 11px; color: var(--muted); margin-top: 6px; }
   /* 小号按钮：数据体检条里两个并排的操作用，不占满宽度 */
   .btn-mini {
     width: auto; flex: 1; margin-bottom: 0;
@@ -206,6 +237,28 @@
   @keyframes spin { to { transform: rotate(360deg); } }
   .loading .hint { color: var(--muted); font-size: 13px; }
   .loading .params-hint { color: var(--text); font-size: 14px; margin-bottom: 12px; }
+
+  /* 全局遮罩：点「运行回测 / 生成调仓清单 / 更新数据」这种几十秒的任务时整页盖上，
+     避免用户以为页面卡死。纯前端、同步请求期间显示，响应回来即隐藏。 */
+  .overlay {
+    position: fixed; inset: 0; z-index: 999;
+    background: rgba(8, 13, 24, 0.72);
+    backdrop-filter: blur(2px);
+    display: flex; align-items: center; justify-content: center;
+  }
+  .overlay[hidden] { display: none; }
+  .overlay-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 32px 40px;
+    text-align: center;
+    min-width: 320px;
+    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+  }
+  .overlay-card .spinner { margin-bottom: 18px; }
+  .overlay-title { color: var(--text); font-size: 15px; font-weight: 600; margin-bottom: 8px; }
+  .overlay-sub { color: var(--muted); font-size: 12px; line-height: 1.7; max-width: 360px; }
 
   /* 指标卡 */
   .metrics {
@@ -297,6 +350,15 @@
 </style>
 </head>
 <body>
+
+<!-- 全局遮罩：长任务进行中显示，详见 showOverlay/hideOverlay -->
+<div id="overlay" class="overlay" hidden>
+  <div class="overlay-card">
+    <div class="spinner"></div>
+    <div class="overlay-title" id="overlayTitle">处理中…</div>
+    <div class="overlay-sub" id="overlaySub"></div>
+  </div>
+</div>
 
 <header>
   <h1>📈 量化回测 · 控制台</h1>
@@ -521,6 +583,46 @@
         </div>
       </details>
 
+      <details id="factorBox">
+        <summary>因子有效性检验（IC / IR）—— 在跑回测前先确认因子是真有效</summary>
+
+        <div class="meta">
+          回测净值为正是「最终结果」，不是「证据」。
+          IC 检验直接回答：这一刻分数排名靠前的股票，未来一段时间是否真的跑赢排名靠后的？
+          一个 IR 0.4+ 的因子才有理由相信后续回测收益不是参数过拟合出来的。
+        </div>
+
+        <div class="field">
+          <label>选因子（多选）</label>
+          <div id="factorChips" class="chips">
+            <label><input type="checkbox" name="fac" value="momentum" checked> 动量 (追涨)</label>
+            <label><input type="checkbox" name="fac" value="reversal" checked> 反转 (均值回归)</label>
+            <label><input type="checkbox" name="fac" value="low_volatility" checked> 低波动</label>
+            <label><input type="checkbox" name="fac" value="ma_trend"> 均线趋势</label>
+            <label><input type="checkbox" name="fac" value="ma_breakout"> 均线突破</label>
+            <label><input type="checkbox" name="fac" value="volume_trend"> 量能</label>
+          </div>
+        </div>
+
+        <div class="field-row">
+          <div class="field">
+            <label>前向持有期（交易日）</label>
+            <input type="number" name="fe_horizon" id="fe_horizon" value="20" min="1" max="120">
+          </div>
+          <div class="field">
+            <label>分组数</label>
+            <input type="number" name="fe_groups" id="fe_groups" value="5" min="3" max="10">
+          </div>
+        </div>
+
+        <button type="button" class="btn btn-alt" id="feBtn" onclick="onFactorEval()">🔬  评估因子</button>
+
+        <div class="meta">
+          直接复用 <b>main.py</b> 的 FACTOR_BUILDERS 与 <code>factor_eval.evaluate_many</code>
+          —— 评估结果与回测用的因子口径完全一致，<b>不是另写一套</b>。
+        </div>
+      </details>
+
       <div class="field check">
         <input type="checkbox" name="use_open" id="use_open" checked>
         <label for="use_open" style="margin: 0">用次日开盘价成交（避免未来函数）</label>
@@ -682,6 +784,8 @@ async function onRefreshData() {
   $('freshbar').className = 'freshbar';
   $('freshIcon').textContent = '·';
   $('freshText').textContent = '正在从数据源增量补齐（几十秒到几分钟，取决于池子大小）…';
+  showOverlay('数据更新中…',
+    '正在把股票池的本地缓存补齐到结束日期。池子越大越久（消费池约 16 秒，含多年缺口约 40 秒），请勿关闭页面。');
 
   try {
     const resp = await fetch('/api/refresh_data', {
@@ -704,6 +808,7 @@ async function onRefreshData() {
     $('freshIcon').textContent = '⚠️';
     $('freshText').textContent = '更新失败: ' + String(err);
   } finally {
+    hideOverlay();
     btn.disabled = false;
     btn.textContent = old;
   }
@@ -778,6 +883,8 @@ async function onSubmit(e) {
     </div>`;
   $('submitBtn').disabled = true;
   $('submitBtn').textContent = '⏳ 运行中...';
+  showOverlay(params.walk_forward ? '样本外验证中…' : '回测运行中…',
+    '任务正在后台执行，请勿关闭页面。完成后会自动显示结果。');
 
   try {
     const resp = await fetch('/api/run', {
@@ -796,6 +903,7 @@ async function onSubmit(e) {
   } catch (err) {
     $('result').innerHTML = `<div class="error">请求失败: ${escapeHtml(String(err))}</div>`;
   } finally {
+    hideOverlay();
     $('submitBtn').disabled = false;
     $('submitBtn').textContent = '▶  运行回测';
   }
@@ -819,6 +927,8 @@ async function onRunPlan() {
     </div>`;
   $('planBtn').disabled = true;
   $('planBtn').textContent = '⏳ 生成中...';
+  showOverlay('生成调仓清单中…',
+    '正在按当前持仓算出该买/该卖多少股，请勿关闭页面。');
 
   try {
     const resp = await fetch('/api/plan', {
@@ -835,9 +945,115 @@ async function onRunPlan() {
   } catch (err) {
     $('result').innerHTML = `<div class="error">请求失败: ${escapeHtml(String(err))}</div>`;
   } finally {
+    hideOverlay();
     $('planBtn').disabled = false;
     $('planBtn').textContent = '📋  生成调仓清单';
   }
+}
+
+/* ----------- 因子评价（IC / IR）----------- */
+async function onFactorEval() {
+  const f = document.forms.runForm;
+  if (!f.pool.value && !f.codes.value) {
+    alert('请先选「股票池」或填「手动代码」');
+    return;
+  }
+  const factors = Array.from(document.querySelectorAll('input[name=fac]:checked'))
+                       .map(el => el.value);
+  if (!factors.length) {
+    alert('请至少选一个因子');
+    return;
+  }
+
+  $('result').innerHTML = `
+    <div class="loading">
+      <div class="spinner"></div>
+      <div class="params-hint">评估 ${escapeHtml(factors.join('、'))}：区间 ${escapeHtml(f.start.value)}~${escapeHtml(f.end.value)}</div>
+      <div class="hint">拉数据 + 算 IC/IR 约 10–20 秒（取决于池子大小和缓存新鲜度）。</div>
+    </div>`;
+  $('feBtn').disabled = true;
+  showOverlay('评估因子有效性中…',
+    '逐期横截面 IC + 衰减 + 分组收益。10–20 秒。');
+
+  const params = {
+    pool: f.pool.value.trim(),
+    codes: f.codes.value.trim(),
+    factors: factors.join(','),
+    horizon: parseInt(f.fe_horizon.value, 10) || 20,
+    n_groups: parseInt(f.fe_groups.value, 10) || 5,
+    start: f.start.value,
+    end: f.end.value,
+  };
+
+  try {
+    const resp = await fetch('/api/factor_eval', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(params),
+    });
+    const d = await resp.json();
+    if (d.error) {
+      $('result').innerHTML = `<div class="error">${escapeHtml(d.error)}</div>`;
+      return;
+    }
+    renderFactorResult(d);
+  } catch (err) {
+    $('result').innerHTML = `<div class="error">请求失败: ${escapeHtml(String(err))}</div>`;
+  } finally {
+    hideOverlay();
+    $('feBtn').disabled = false;
+  }
+}
+
+function renderFactorResult(d) {
+  let html = freshnessBanner();
+  html += `<div class="summary">`;
+  html += `<h3>因子 IC / IR · ${escapeHtml(d.factors.length)} 个因子 · ${d.n_codes} 只标的${d.warning ? ' · <span style="color:var(--warn)">' + escapeHtml(d.warning) + '</span>' : ''}</h3>`;
+
+  // 摘要卡片：每个因子一张
+  html += '<div class="ic-cards">';
+  d.summary.forEach(s => {
+    const ir = s.ir;
+    const irCls = ir == null ? 'muted' : (ir >= 0.5 ? 'good' : (ir < 0.3 ? 'bad' : ''));
+    // 颜色阈值：IR>=0.5 表示因子强稳定可用；IR<0.3 表示基本无效
+    const verdictCls = ir == null ? '' : (ir >= 0.5 ? 'good' : (ir < 0.3 ? 'bad' : ''));
+    const longShort = s.long_short != null ? (s.long_short * 100).toFixed(2) + '%' : '-';
+    const posIC = s.positive_ratio != null ? (s.positive_ratio * 100).toFixed(0) + '%' : '-';
+    html += `<div class="ic-card">
+      <div class="nm">${escapeHtml(s.name)}</div>
+      <div class="ir ${irCls}">${ir == null ? '-' : (ir >= 0 ? '+' : '') + ir.toFixed(3)}</div>
+      <div class="meta2">IR (|t| = ${fmtNum(s.t_stat)} ; 期数 ${s.n})</div>
+      <div class="meta2">IC均值 ${s.mean_ic == null ? '-' : (s.mean_ic >= 0 ? '+' : '') + s.mean_ic.toFixed(4)} · 正IC ${posIC}</div>
+      <div class="meta2">多空(每期) ${longShort}</div>
+      <div class="verdict ${verdictCls}">${escapeHtml(s.verdict)}</div>
+    </div>`;
+  });
+  html += '</div>';
+
+  // 解读提示（一个 IR 一个结论）
+  html += `<div class="meta" style="margin-top:14px">
+    <b>怎么看：</b>
+    IR (Information Ratio) 是 IC 均值 / IC 标准差，衡量因子预测力的<b>稳定性</b>。
+    比 IC 均值更该被重视——一个 IC 均值 0.05 但标准差 0.3 的因子，本质上不可用。
+    经验刻度：IR &lt; 0.3 基本无效；0.3~0.5 可用；0.5~0.8 强；&gt; 0.8 优秀且要警惕数据泄漏。
+    评价为「基本无效」的因子不应该单用，应通过多因子合成增强。
+  </div>`;
+
+  // 完整报告链接
+  if (d.report) {
+    html += `<div class="links" style="margin-top:10px"><a class="dl" href="/report/${encodeURIComponent(d.report)}" target="_blank">📈  打开完整报告（IC 曲线 + 衰减 + 分组收益）</a></div>`;
+  }
+  html += '</div>';
+  $('result').innerHTML = html;
+}
+
+/* 预设：只勾「在消费池上稳定」的因子 —— 对应 README 第 22 行「消费·reversal_20 / 沪深300·reversal_20」。
+   但 IC 检验一般要多看几个并列因子，所以默认仍保留 momentum/reversal/low_volatility 三个；
+   想要更纯净就把 momentum 和 reversal 都关掉只看 low_volatility。 */
+function fillFactorPreset(names) {
+  document.querySelectorAll('input[name=fac]').forEach(el => {
+    el.checked = names.includes(el.value);
+  });
 }
 
 function escapeHtml(s) {
@@ -845,6 +1061,20 @@ function escapeHtml(s) {
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
   }[c]));
 }
+
+/* 全局遮罩：长任务（回测 / 调仓清单 / 数据更新）进行中整页盖一层，
+   明确告诉用户「在跑、请等」，而不是干看着以为卡死。隐藏时把标题/副文案清空。 */
+function showOverlay(title, sub) {
+  $('overlayTitle').textContent = title || '处理中…';
+  $('overlaySub').textContent = sub || '';
+  $('overlay').hidden = false;
+}
+function hideOverlay() {
+  $('overlay').hidden = true;
+  $('overlayTitle').textContent = '处理中…';
+  $('overlaySub').textContent = '';
+}
+
 
 /* ----------- 通用格式化（A 股习惯：涨=红，跌=绿） ----------- */
 const fmtPct = v => (v == null || isNaN(v)) ? '-' : (v >= 0 ? '+' : '') + (v * 100).toFixed(1) + '%';

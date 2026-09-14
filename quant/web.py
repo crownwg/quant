@@ -64,6 +64,33 @@ class RunParams(BaseModel):
     plan_date: str = Field("", description="清单基准日 YYYYMMDD，留空 = 回测区间最后一天")
 
 
+# ----- 因子评价（IC / IR）入参 -----
+# 与 RunParams 分开：因为 IC 评估需要「因子名 + 因子专属窗口」，
+# 而回测只需要「单因子名 + 通用窗口」。让用户在页面上直观地选多个因子诊断。
+class FactorEvalParams(BaseModel):
+    pool: str = Field("", description="股票池（消费/医药/hs300 等）")
+    codes: str = Field("", description="手动代码，逗号分隔；与股票池取并集")
+    factors: str = Field(
+        "momentum,reversal,low_volatility",
+        description="因子列表，逗号分隔；按 list 顺序出报告")
+    horizon: int = Field(20, description="前向持有期（交易日）；月度调仓用 20")
+    n_groups: int = Field(5, description="分组数，默认 5")
+
+    # 因子窗口参数（不同因子用不同窗口）
+    lookback: int = Field(120, description="动量 / 低波回看期")
+    skip_recent: int = Field(0, description="动量跳过最近 N 日（12-1 动量的 -1）")
+    reversal_lookback: int = Field(20, description="反转回看期")
+    ma_short: int = Field(20, description="均线趋势短期")
+    ma_long: int = Field(60, description="均线趋势长期")
+    ma_window: int = Field(60, description="均线突破窗口")
+    vol_lookback: int = Field(60, description="低波动回看期")
+    vol_short: int = Field(5, description="量能短期")
+    vol_long: int = Field(60, description="量能长期")
+
+    start: str = Field("20210101")
+    end: str = Field("20240909")
+
+
 # ----- 路由 -----
 @app.get("/", response_class=HTMLResponse)
 async def index() -> str:
@@ -254,7 +281,7 @@ async def run_backtest(p: RunParams) -> dict:
         return {"error": f"结果解析失败: {exc}"}
 
 
-def _resolve_codes(p: RunParams) -> tuple[list[str], str | None]:
+def _resolve_codes(p) -> tuple[list[str], str | None]:
     """把页面上的「股票池 / 手动代码」解析成 6 位代码列表。
 
     直接复用 quant.universe，不另写一套解析——两边口径一旦不同，
@@ -264,17 +291,22 @@ def _resolve_codes(p: RunParams) -> tuple[list[str], str | None]:
     「在消费池上补一只 002557」——它在所有指数成分股里都没有，
     只能靠手动代码加进来。
     返回 (codes, error)；error 非空表示解析失败。
+
+    p 只要有 .pool / .codes 两个字段即可，RunParams 和 FactorEvalParams
+    都用这个解析路径，避免两套口径漂移。
     """
     from quant import universe
 
+    pool = (getattr(p, "pool", "") or "").strip()
+    raw_codes = (getattr(p, "codes", "") or "").strip()
     codes: list[str] = []
-    if p.pool.strip():
+    if pool:
         try:
-            codes, _ = universe.build_universe_report(p.pool.strip())
+            codes, _ = universe.build_universe_report(pool)
         except Exception as exc:  # noqa: BLE001  网络/池名错都归到这里
             return [], f"股票池解析失败: {exc}"
 
-    raw = [c.strip() for c in re.split(r"[,\s;，、]+", p.codes) if c.strip()]
+    raw = [c.strip() for c in re.split(r"[,\s;，、]+", raw_codes) if c.strip()]
     seen = set(codes)
     for c in raw:
         if c.isdigit():
@@ -449,6 +481,128 @@ async def run_plan(p: RunParams) -> dict:
     res["skipped"] = skipped
     res["plan_date"] = (p.plan_date or "").strip() or "回测区间最后一天"
     return res
+
+
+# ----- 因子评价（IC / IR） -----
+# 与上面走 subprocess 模式不同，本接口走 in-process：
+#   - 数据量小（一只池子 < 200 只 × 几百期），不需要像回测那样隔离
+#   - 复用 main.py 的 FACTOR_BUILDERS 保证因子口径与回测完全一致
+#   - 复用 factor_eval.evaluate_many 拿 IC / IR / 衰减 / 分组收益
+#   - 复用 factor_eval.build_ic_report 出 HTML 报告（含 ECharts 三图 + 汇总表）
+# 不进 subprocess 的另一理由：网页上「按月 IC」跑 6 个因子也就 10~20 秒，
+# 起一个新 Python 进程的 1~2 秒比值不大，但能少维护一个 CLI 子命令。
+_KNOWN_FACTORS = {"momentum", "reversal", "ma_trend", "ma_breakout",
+                  "low_volatility", "volume_trend"}
+
+
+class _FactorArgs:
+    """容器：装给 FACTOR_BUILDERS 用的窗口参数。
+
+    FACTOR_BUILDERS 的签名是 (args, prices, volume)，其中 args 像 argparse
+    Namespace 一样属性访问。这里只装它真正读的几个字段。
+    """
+
+    def __init__(self, p: FactorEvalParams) -> None:
+        self.lookback = p.lookback
+        self.skip_recent = p.skip_recent
+        self.reversal_lookback = p.reversal_lookback
+        self.ma_short = p.ma_short
+        self.ma_long = p.ma_long
+        self.ma_window = p.ma_window
+        self.vol_lookback = p.vol_lookback
+        self.vol_short = p.vol_short
+        self.vol_long = p.vol_long
+
+
+@app.post("/api/factor_eval")
+async def factor_eval(p: FactorEvalParams) -> dict:
+    """对一组因子做 IC / IR 诊断，生成 HTML 报告与摘要表。
+
+    为什么单独有这条而不是回测的隐藏模式：
+    IC 检验直接回答「这个因子到底有没有用」，是回测赚钱之前的必要一步。
+    把它从回测里拉出来独立成入口，是为了防止用户「没诊断就上策略」。
+    """
+    from quant import factor_eval as fe
+    from quant.data import load_panel
+    from quant.main import FACTOR_BUILDERS
+
+    codes, err = _resolve_codes(p)
+    if err:
+        return {"error": err}
+
+    # 因子名过滤：未知直接报错，HTML 报告里 render 会 panic
+    factors = [s.strip() for s in p.factors.split(",") if s.strip()]
+    unknown = [f for f in factors if f not in _KNOWN_FACTORS]
+    if unknown:
+        return {"error": f"不支持的因子: {','.join(unknown)}；可选: {','.join(sorted(_KNOWN_FACTORS))}"}
+    if not factors:
+        return {"error": "请至少选一个因子"}
+
+    # 区间反推 fetch_start（多留一倍最大窗口，避免 IC 第一期没数据）
+    # 这些窗口 1~120 不等，120 倍数 1.5 倍够用；保守起见按 240 天回看。
+    fetch_start = (pd.Timestamp(p.start) - pd.Timedelta(days=240)).strftime("%Y%m%d")
+
+    try:
+        panel = load_panel(codes, fetch_start, p.end, sleep=0.3, on_error="skip")
+    except Exception as exc:  # noqa: BLE001  数据源打嗝不该让接口崩
+        return {"error": f"加载数据失败: {exc}"}
+
+    if panel["close"].empty:
+        return {"error": "没有任何可用数据，请先点「更新数据」把池子补齐"}
+
+    if len(panel["close"].columns) < len(codes):
+        skipped_codes = set(codes) - set(panel["close"].columns)
+        # 不返回 error：部分缺失仍可出报告，前端在 UI 上提示即可
+        load_warning = f"已过滤 {len(skipped_codes)} 只无数据标的: {','.join(sorted(skipped_codes)[:20])}"
+    else:
+        load_warning = ""
+
+    args = _FactorArgs(p)
+    score_dict: dict[str, pd.DataFrame] = {}
+    for name in factors:
+        try:
+            score_dict[name] = FACTOR_BUILDERS[name](args, panel["close"], panel["volume"])
+        except Exception as exc:  # noqa: BLE001  单个因子挂了不应该让整组都失败
+            return {"error": f"计算 {name} 因子失败: {exc}"}
+
+    try:
+        results = fe.evaluate_many(score_dict, panel["close"],
+                                   n_groups=p.n_groups)
+    except Exception as exc:
+        return {"error": f"IC 评估失败: {exc}"}
+
+    # 报告文件写到项目根目录，UUID 前缀防撞
+    out_html = ROOT / f"factor_{uuid.uuid4().hex[:8]}.html"
+    title = f"因子有效性 · {p.pool.strip() or '自定义代码'}"
+    subtitle = (f"区间 {p.start}~{p.end} · {len(score_dict)} 个因子 · "
+                f"{len(panel['close'].columns)} 只标的 · 前向 {p.horizon} 日")
+    fe.build_ic_report(results, str(out_html), title=title, subtitle=subtitle)
+
+    # 摘要表给前端展示（不必再让用户打开完整报告就有结论）
+    summary = []
+    for r in results:
+        s = r["summary"]
+        summary.append({
+            "name": r["name"],
+            "n": s["n"],
+            "mean_ic": _json_safe(s["mean_ic"]),
+            "std_ic": _json_safe(s["std_ic"]),
+            "ir": _json_safe(s["ir"]),
+            "t_stat": _json_safe(s["t_stat"]),
+            "positive_ratio": _json_safe(s["positive_ratio"]),
+            "verdict": s["verdict"],
+            "long_short": _json_safe(r["long_short"]),
+        })
+
+    return {
+        "ok": True,
+        "report": out_html.name,
+        "factors": factors,
+        "n_codes": len(panel["close"].columns),
+        "n_periods": next((s["n"] for s in [r["summary"] for r in results] if s["n"]), 0),
+        "summary": summary,
+        "warning": load_warning,
+    }
 
 
 # ----- 结果解析 -----
