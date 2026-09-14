@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>三一重工 600031 · 单只股票适合哪个策略</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin:0; padding:32px 24px 60px; background:#f5f6f8; color:#1a1d21;
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+    line-height:1.6; }
+  .wrap { max-width:1060px; margin:0 auto; }
+  h1 { font-size:25px; margin:0 0 6px; font-weight:600; }
+  .sub { color:#6b7280; font-size:14px; margin-bottom:22px; }
+  .verdict { background:#fff; border:2px solid #d92b2b; border-radius:12px;
+    padding:20px 24px; margin-bottom:22px; }
+  .verdict .t { font-size:16px; font-weight:600; color:#d92b2b; margin-bottom:8px; }
+  .verdict p { margin:6px 0; font-size:14px; }
+  .panel { background:#fff; border:1px solid #e5e7eb; border-radius:10px;
+    padding:18px 20px; margin-bottom:18px; }
+  .panel h2 { font-size:16px; margin:0 0 6px; font-weight:600; }
+  .panel .hint { font-size:12.5px; color:#6b7280; margin-bottom:14px; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th { text-align:left; padding:9px 10px; border-bottom:2px solid #e5e7eb;
+    color:#6b7280; font-weight:500; font-size:12px; }
+  td { padding:9px 10px; border-bottom:1px solid #f0f1f3; }
+  tr:hover td { background:#fafbfc; }
+  .num { text-align:right; font-variant-numeric:tabular-nums; white-space:nowrap; }
+  .idx { color:#9ca3af; font-size:12px; }
+  .dt { font-size:12px; color:#6b7280; white-space:nowrap; }
+  .up { color:#d92b2b; } .down { color:#0a9b53; } .flat { color:#6b7280; }
+  tr.base td { background:#f0f4f8; }
+  tr.hl td { background:#fff5f5; }
+  tr.zero td { opacity:.55; }
+  .tag { background:#e8f3ec; color:#0a7a42; font-size:10.5px; padding:2px 6px;
+    border-radius:4px; margin-left:6px; white-space:nowrap; }
+  .bar { width:100%; height:16px; background:#eef0f2; border-radius:3px; overflow:hidden; }
+  .fill { height:100%; background:#4b5563; }
+  .two { display:flex; gap:18px; flex-wrap:wrap; }
+  .two > div { flex:1 1 420px; }
+  .warn { background:#fff8e6; border:1px solid #f5d98b; border-radius:10px;
+    padding:16px 20px; font-size:13px; color:#6b5518; }
+  .warn b { color:#8a6d1a; }
+  .warn ul { margin:8px 0 0; padding-left:20px; }
+  .warn li { margin-bottom:6px; }
+  code { background:#f0f1f3; padding:1px 5px; border-radius:3px; font-size:12px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>三一重工 600031 · 单只股票适合哪个策略？</h1>
+<div class="sub">
+  单只票只能用「择时」比（选股策略在一只票上会退化成买入并持有，彼此没区别）&nbsp;·&nbsp;
+  31 种择时组合&nbsp;·&nbsp;2020-01 ~ 2026-09&nbsp;·&nbsp;数据截至 2026-09-11
+</div>
+
+<div class="verdict">
+  <div class="t">⚠️ 结论：全样本说「动量最好」，样本外验证把它推翻了</div>
+  <p><b>用全部历史数据回测</b>，动量择时看起来最强——10 个参数里 6 个跑赢「一直拿着」，中位收益 +35.6%。</p>
+  <p><b>但做样本外验证（把数据切成 8 段，只用前面的段选策略、在后面的段上验证）时，动量择时
+  <span style="color:#d92b2b">8 段里一次都没被选中</span></b>，被选中的是均线（5 次）和双确认（3 次）。</p>
+  <p>这就是「事后选参的幻觉」：<b>回头看哪个最好，和事前选哪个会好，是两件完全不同的事。</b></p>
+</div>
+
+<div class="two">
+  <div>
+    <div class="panel">
+      <h2>① 全样本回测（回头看）</h2>
+      <div class="hint">31 种组合一起跑，看哪组在<b>整段历史</b>上表现好。「跑赢基线」= 收益超过「一直拿着」的 +29.1%。</div>
+      <table>
+        <thead><tr><th>策略</th><th class="num">跑赢基线</th><th class="num">中位收益</th>
+        <th class="num">夏普</th><th class="num">回撤</th><th class="num">最好/最差</th></tr></thead>
+        <tbody><tr class="base"><td><b>不择时（一直拿着）</b></td><td>—</td>
+<td class="num">+29.1%</td><td class="num">0.29</td>
+<td class="num down">-73.0%</td><td class="num">—</td></tr><tr><td>均线择时（站上均线持有）</td><td class="num">2/10</td>
+<td class="num">+14.6%</td><td class="num">0.24</td>
+<td class="num down">-53.3%</td><td class="num">+75.4% / -10.7%</td></tr><tr class="hl"><td>动量择时（涨了才持有）</td><td class="num">6/10</td>
+<td class="num">+35.6%</td><td class="num">0.33</td>
+<td class="num down">-56.8%</td><td class="num">+121.8% / +1.1%</td></tr><tr><td>双确认（均线+斜率）</td><td class="num">3/10</td>
+<td class="num">+25.9%</td><td class="num">0.23</td>
+<td class="num down">-51.1%</td><td class="num">+59.9% / -15.5%</td></tr></tbody>
+      </table>
+      <div class="hint" style="margin:12px 0 0">→ 动量看起来最好（<b>6/10 跑赢</b>），但这只是「回头看」。</div>
+    </div>
+  </div>
+  <div>
+    <div class="panel">
+      <h2>② 样本外验证（事前选）</h2>
+      <div class="hint">把 6 年切成 8 段，每段<b>只用前面的数据</b>选策略、在<b>后面没见过的数据</b>上验证。这才是真实的「事前」。</div>
+      <table>
+        <thead><tr><th>策略</th><th class="num">被选中次数</th><th></th></tr></thead>
+        <tbody><tr><td>均线择时（站上均线持有）</td>
+<td class="num"><b>5</b> / 8</td>
+<td><div class="bar"><div class="fill" style="width:62%"></div></div></td></tr><tr class="zero"><td>动量择时（涨了才持有）</td>
+<td class="num"><b>0</b> / 8</td>
+<td><div class="bar"><div class="fill" style="width:0%"></div></div></td></tr><tr><td>双确认（均线+斜率）</td>
+<td class="num"><b>3</b> / 8</td>
+<td><div class="bar"><div class="fill" style="width:38%"></div></div></td></tr><tr class="zero"><td>不择时</td>
+<td class="num"><b>0</b> / 8</td>
+<td><div class="bar"><div class="fill" style="width:0%"></div></div></td></tr></tbody>
+      </table>
+      <div class="hint" style="margin:12px 0 0">→ <b>动量 0 次</b>。全样本里它最强，样本外一次没选上。</div>
+    </div>
+  </div>
+</div>
+
+<div class="panel">
+  <h2>③ 样本外真实成绩（8 段拼起来）</h2>
+  <div class="hint">
+    下面每行是「同一批未见过的数据」上，不同<b>选参方式</b>的成绩。
+    <b>带「诚实预期」标签的那两行最关键</b>——它们故意不挑最好的参数（因为挑最好本身就是作弊），
+    所以最接近实盘能拿到的结果。
+  </div>
+  <table>
+    <thead><tr><th>做法</th><th class="num">样本外总收益</th><th class="num">平均夏普</th>
+    <th class="num">最差段回撤</th><th class="num">赚钱段占比</th></tr></thead>
+    <tbody><tr class="hl"><td>Walk-Forward 自适应参数（训练窗 argmax） </td>
+<td class="num up"><b>+23.9%</b></td>
+<td class="num">0.30</td><td class="num down">-25.1%</td>
+<td class="num">50%</td></tr><tr><td>Walk-Forward 邻域平滑选参（不踩尖峰） <span class="tag">诚实预期</span></td>
+<td class="num down"><b>-19.9%</b></td>
+<td class="num">-0.24</td><td class="num down">-30.0%</td>
+<td class="num">25%</td></tr><tr><td>参数集成（平滑分前 3 组等权） <span class="tag">诚实预期</span></td>
+<td class="num down"><b>-3.9%</b></td>
+<td class="num">-0.04</td><td class="num down">-24.9%</td>
+<td class="num">38%</td></tr><tr><td>参数集成（平滑分前 5 组等权） </td>
+<td class="num down"><b>-7.1%</b></td>
+<td class="num">-0.04</td><td class="num down">-25.0%</td>
+<td class="num">38%</td></tr><tr><td>参数集成（平滑分前 10 组等权） </td>
+<td class="num down"><b>-8.5%</b></td>
+<td class="num">-0.02</td><td class="num down">-26.6%</td>
+<td class="num">38%</td></tr><tr><td>参数集成（全部 31 组等权） </td>
+<td class="num down"><b>-8.7%</b></td>
+<td class="num">-0.16</td><td class="num down">-23.2%</td>
+<td class="num">50%</td></tr><tr><td>全样本最优固定参数（事后选参） </td>
+<td class="num up"><b>+24.8%</b></td>
+<td class="num">0.18</td><td class="num down">-26.2%</td>
+<td class="num">62%</td></tr><tr><td>默认参数（不调参） </td>
+<td class="num up"><b>+2.8%</b></td>
+<td class="num">0.16</td><td class="num down">-30.8%</td>
+<td class="num">50%</td></tr></tbody>
+  </table>
+  <div class="hint" style="margin:12px 0 0">
+    注意：看起来最好的「自适应选参」(+23.9%) 和「全样本最优」(+24.8%)
+    几乎一样——但所有<b>不挑尖峰</b>的稳健做法（-19.9% ~ -3.9%）<b>全是负的</b>。
+    如果策略真有效，稳健做法不该全部跑输。所以那 +23.9% 大概率是<b>运气</b>。
+  </div>
+</div>
+
+<div class="panel">
+  <h2>④ 逐段明细（每一段选了什么、结果如何）</h2>
+  <div class="hint">「样本内夏普」是选策略时看到的分数，「样本外夏普」是真实考分。两者差距大 = 选了个中看不中用的。</div>
+  <table>
+    <thead><tr><th>段</th><th>验证区间</th><th>选中的策略</th><th class="num">样本内夏普</th>
+    <th class="num">样本外夏普</th><th class="num">该段收益</th><th class="num">集成版</th></tr></thead>
+    <tbody><tr><td class="idx">1</td><td class="dt">2022-01-28~2022-08-08</td>
+<td><b>ma</b>(200日,带2%)</td>
+<td class="num">0.93</td><td class="num">0.00</td>
+<td class="num flat"><b>+0.0%</b></td>
+<td class="num flat">+0.0%</td></tr><tr><td class="idx">2</td><td class="dt">2022-08-09~2023-02-16</td>
+<td><b>dual</b>(90日,带0%)</td>
+<td class="num">0.98</td><td class="num">0.92</td>
+<td class="num up"><b>+5.8%</b></td>
+<td class="num up">+0.8%</td></tr><tr><td class="idx">3</td><td class="dt">2023-02-17~2023-08-21</td>
+<td><b>dual</b>(90日,带0%)</td>
+<td class="num">-0.18</td><td class="num">-1.29</td>
+<td class="num down"><b>-11.4%</b></td>
+<td class="num down">-12.0%</td></tr><tr><td class="idx">4</td><td class="dt">2023-08-22~2024-03-01</td>
+<td><b>dual</b>(90日,带0%)</td>
+<td class="num">-0.18</td><td class="num">0.00</td>
+<td class="num flat"><b>+0.0%</b></td>
+<td class="num down">-5.6%</td></tr><tr><td class="idx">5</td><td class="dt">2024-03-04~2024-09-03</td>
+<td><b>ma</b>(40日,带2%)</td>
+<td class="num">-0.01</td><td class="num">1.91</td>
+<td class="num up"><b>+22.9%</b></td>
+<td class="num up">+12.7%</td></tr><tr><td class="idx">6</td><td class="dt">2024-09-04~2025-03-18</td>
+<td><b>ma</b>(40日,带2%)</td>
+<td class="num">0.94</td><td class="num">1.04</td>
+<td class="num up"><b>+15.8%</b></td>
+<td class="num up">+15.8%</td></tr><tr><td class="idx">7</td><td class="dt">2025-03-19~2025-09-17</td>
+<td><b>ma</b>(40日,带2%)</td>
+<td class="num">0.82</td><td class="num">0.36</td>
+<td class="num up"><b>+2.7%</b></td>
+<td class="num down">-3.0%</td></tr><tr><td class="idx">8</td><td class="dt">2025-09-18~2026-04-01</td>
+<td><b>ma</b>(40日,带2%)</td>
+<td class="num">1.06</td><td class="num">-0.57</td>
+<td class="num down"><b>-9.6%</b></td>
+<td class="num down">-9.4%</td></tr></tbody>
+  </table>
+  <div class="hint" style="margin:12px 0 0">
+    收益高度集中在第 5、6 段（2024~2025 那波行情，+22.9%、+15.8%）。
+    其余 6 段基本在 ±10% 内打转。<b>去掉这两段，策略就不剩什么了。</b>
+  </div>
+</div>
+
+<div class="warn">
+  <b>所以，三一重工到底适合哪个策略？</b>
+  <ul>
+    <li><b>诚实的答案：没有稳定适合它的策略。</b>全样本说动量，样本外说均线，两者矛盾；
+        换一批数据、换一段时间，结论还会再变。这是单只股票的固有属性——
+        <b>一只票的走势噪声太大，任何规则都容易是巧合。</b></li>
+    <li><b>唯一比较稳的一条：择时能把回撤压下来。</b>
+        「一直拿着」最差段回撤 -30.8%，加了择时后压到 -24.9% 左右。
+        这是机制决定的（空仓时自然跌得少），不是预测准。</li>
+    <li><b>别用那个 +121.8% 的「动量90日」当预期。</b>
+        它所在的组样本外一次都没被选上，是典型的拟合产物。
+        要预期，看集成版的 -3.9% 更接近现实。</li>
+    <li><b>单只票做量化本身就是hard模式。</b>组合里 10~15 只票能互相分散噪声，
+        一只票的所有风险都集中在一个公司的经营和估值上，规则能起的作用很有限。</li>
+    <li>本报告是历史回放，<b>不是预测、不是买卖建议</b>。</li>
+  </ul>
+</div>
+
+<div class="panel">
+  <h2>想自己复现 / 换只票试</h2>
+  <div class="hint">把 <code>600031</code> 换成别的 6 位代码即可。第一条是「回头看」，第二条是「事前验证」，<b>两条都要跑</b>。</div>
+  <pre style="background:#f8f9fa;padding:14px 16px;border-radius:8px;overflow-x:auto;font-size:12.5px;line-height:1.7;margin:0"><code># ① 全样本：扫 31 种择时组合
+.venv/Scripts/python.exe -m quant.main --codes 600031 \
+  --top-n 1 --use-open --rebalance M \
+  --start 20200101 --end 20260910 --benchmark "" \
+  --grid --grid-lookbacks 20 --grid-topn 1 --grid-buffers 0 \
+  --grid-timing off,ma,momentum,dual \
+  --grid-timing-lookbacks 40,60,90,120,200 --grid-timing-bands 0,0.02
+
+# ② 样本外验证：同样 31 组，但切成 8 段做「事前选、事后验」
+.venv/Scripts/python.exe -m quant.main --codes 600031 \
+  --top-n 1 --use-open --rebalance M \
+  --start 20200101 --end 20260910 --benchmark "" \
+  --walk-forward --fw-train 2 --fw-test 0.5 \
+  --grid-lookbacks 20 --grid-topn 1 --grid-buffers 0 \
+  --grid-timing off,ma,momentum,dual \
+  --grid-timing-lookbacks 40,60,90,120,200 --grid-timing-bands 0,0.02</code></pre>
+  <div class="hint" style="margin:12px 0 0">
+    关键参数 <code>--timing-proxy pool</code>（默认就是它）会拿「池子的等权净值」当择时信号；
+    <b>池子只有一只票时，信号就是这只票自己的价格</b>——这正是单只票能跑择时的原因。
+  </div>
+</div>
+
+</div>
+</body>
+</html>

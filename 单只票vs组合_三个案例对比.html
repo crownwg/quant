@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>单只票 vs 一篮子组合 · 全样本 vs 样本外</title>
+<style>
+  * { box-sizing:border-box; }
+  body { margin:0; padding:32px 24px 60px; background:#f5f6f8; color:#1a1d21;
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+    line-height:1.62; }
+  .wrap { max-width:1080px; margin:0 auto; }
+  h1 { font-size:25px; margin:0 0 6px; font-weight:600; }
+  .sub { color:#6b7280; font-size:14px; margin-bottom:22px; }
+  .mut { color:#9ca3af; font-size:12px; }
+  .up { color:#d92b2b; } .down { color:#0a9b53; } .flat { color:#6b7280; }
+  .ok { color:#0a7a42; font-weight:600; } .bad { color:#d92b2b; font-weight:600; }
+  .verdict { background:#fff; border:2px solid #d92b2b; border-radius:12px;
+    padding:20px 24px; margin-bottom:22px; }
+  .verdict .t { font-size:16px; font-weight:600; color:#d92b2b; margin-bottom:10px; }
+  .verdict ol { margin:8px 0 0; padding-left:22px; }
+  .verdict li { margin-bottom:8px; font-size:14px; }
+  .panel { background:#fff; border:1px solid #e5e7eb; border-radius:10px;
+    padding:18px 20px; margin-bottom:18px; }
+  .panel h2 { font-size:16px; margin:0 0 6px; font-weight:600; }
+  .hint { font-size:12.5px; color:#6b7280; margin-bottom:14px; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th { text-align:left; padding:9px 10px; border-bottom:2px solid #e5e7eb;
+    color:#6b7280; font-weight:500; font-size:12px; }
+  td { padding:10px; border-bottom:1px solid #f0f1f3; vertical-align:top; }
+  tr:hover td { background:#fafbfc; }
+  .num { text-align:right; font-variant-numeric:tabular-nums; white-space:nowrap; }
+  .bar2 { width:100%; }
+  .bar2 div { height:17px; border-radius:2px; margin-bottom:3px; font-size:10px;
+    color:#fff; line-height:17px; padding-left:5px; white-space:nowrap; }
+  .f1 { background:#d98b8b; } .f2 { background:#0a9b53; }
+  .warn { background:#fff8e6; border:1px solid #f5d98b; border-radius:10px;
+    padding:16px 20px; font-size:13px; color:#6b5518; }
+  .warn b { color:#8a6d1a; }
+  .warn ul { margin:8px 0 0; padding-left:20px; }
+  .warn li { margin-bottom:6px; }
+  code { background:#f0f1f3; padding:1px 5px; border-radius:3px; font-size:12px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>单只票 vs 一篮子组合 · 全样本 vs 样本外</h1>
+<div class="sub">
+  同一套流程跑了 3 个标的 · 每个都扫 31 种择时组合 · 每个都切成 8 段做样本外验证 ·
+  2020-01 ~ 2026-09 · 数据截至 2026-09-11
+</div>
+
+<div class="verdict">
+  <div class="t">三条结论（按可信度排序）</div>
+  <ol>
+    <li><b>「回头看哪个最好」三次全被样本外推翻。</b>
+        三一：回头看动量最强，样本外 8 段里动量 <b>0 次</b>被选中。
+        洽洽：回头看双确认最好，样本外 <b>7/8 段选的是动量</b>。
+        组合：事后选参比自适应选参<b>高估 21.8 个百分点</b>。
+        → <b>任何「我用历史数据找到了最优参数」的说法，在验证之前都不可信。</b></li>
+    <li><b>唯一跨三个案例都成立的是「压回撤」。</b>
+        加了择时后，最差那一段的回撤全部缩小（−30.8%→−24.9%、−35.4%→−24.0%、−23.3%→−11.8%）。
+        这是机制决定的（空仓时自然跌得少），<b>不是预测得准</b>。</li>
+    <li><b>但压回撤是要付代价的：收益会变少。</b>
+        组合上「不择时」(−4.9%) 反而比所有择时做法都好。
+        想少亏，就得接受少赚。</li>
+  </ol>
+</div>
+
+<div class="panel">
+  <h2>① 全样本 vs 样本外：三次都对不上</h2>
+  <div class="hint">
+    「全样本」= 用全部 6 年数据回头找最优；「样本外」= 切成 8 段，只用前面的段选策略、在后面没见过的段上验证（这更接近真实操作）。
+  </div>
+  <table>
+    <thead><tr><th>标的</th><th>回头看：哪个最好</th><th>样本外 8 段实际选中</th><th>对得上吗</th></tr></thead>
+    <tbody><tr>
+<td><b>三一重工 600031</b><br><span class="mut">单只票（工程机械）</span></td>
+<td>动量<br><span class="mut">6/10 跑赢基线，中位 35.6%，最好一组 +121.8%</span></td>
+<td>均线 5、双确认 3</td>
+<td><span class="bad">样本外只有 0/8</span></td></tr><tr>
+<td><b>洽洽食品 002557</b><br><span class="mut">单只票（食品消费）</span></td>
+<td>双确认<br><span class="mut">亏得最少 −6.2%，基线一直拿着 −31.0%</span></td>
+<td>动量 7、双确认 1</td>
+<td><span class="bad">样本外只有 1/8</span></td></tr><tr>
+<td><b>消费+蓝筹组合</b><br><span class="mut">一篮子（12 只里选 5 只）</span></td>
+<td>（未单列）<br><span class="mut">事后选参 −14.9%，自适应 −36.7%，高估 21.8pp</span></td>
+<td>均线 4、动量 2、不择时 2</td>
+<td><span class="bad">高估 21.8pp</span></td></tr></tbody>
+  </table>
+  <div class="hint" style="margin:12px 0 0">
+    注意洽洽和三一的方向<b>完全相反</b>：一个样本外选均线、一个选动量。
+    这说明<b>单只票不存在普适规则</b>——换个标的，最优策略就变了。
+  </div>
+</div>
+
+<div class="panel">
+  <h2>② 样本外真实成绩（同一批没见过的数据）</h2>
+  <div class="hint">
+    每行是一种「选参数的做法」。<b>加粗列（集成 K=3）是诚实预期</b>——
+    它故意不挑最好的参数（挑最好本身就是作弊），所以最接近实盘能拿到的结果。
+  </div>
+  <table>
+    <thead><tr><th>标的</th><th class="num">挑最好的参数</th><th class="num">邻域平滑</th>
+    <th class="num">集成 K=3<br>（诚实预期）</th><th class="num">全样本最优<br>（事后选参）</th>
+    <th class="num">不调参<br>（一直拿着）</th></tr></thead>
+    <tbody><tr>
+<td><b>三一重工 600031</b></td>
+<td class="num up">+23.9%</td>
+<td class="num down">-19.9%</td>
+<td class="num down"><b>-3.9%</b></td>
+<td class="num up">+24.8%</td>
+<td class="num up">+2.8%</td></tr><tr>
+<td><b>洽洽食品 002557</b></td>
+<td class="num down">-42.8%</td>
+<td class="num down">-49.7%</td>
+<td class="num down"><b>-36.5%</b></td>
+<td class="num down">-12.3%</td>
+<td class="num down">-53.3%</td></tr><tr>
+<td><b>消费+蓝筹组合</b></td>
+<td class="num down">-36.7%</td>
+<td class="num down">-24.2%</td>
+<td class="num down"><b>-23.7%</b></td>
+<td class="num down">-14.9%</td>
+<td class="num down">-4.9%</td></tr></tbody>
+  </table>
+  <div class="hint" style="margin:12px 0 0">
+    <b>关键观察</b>：三一上「挑最好的参数」(+23.9%) 看起来很美，但「不挑尖峰」的版本是 <b>−3.9%</b>；
+    组合上差距更大（−36.7% vs −16.6%，差 20 个百分点）。
+    <b>如果策略真有效，稳健版本不该集体跑输——所以那些好看的数字主要是运气。</b>
+  </div>
+</div>
+
+<div class="panel">
+  <h2>③ 唯一稳定的结论：择时能压回撤（三个案例全部验证）</h2>
+  <div class="hint">
+    「最差段回撤」= 8 段里亏得最狠那一段的跌幅。这是最该关心的数字——它决定了你在最难受的时候会不会扛不住走人。
+  </div>
+  <table>
+    <thead><tr><th>标的</th><th class="num">不择时</th><th class="num">加择时（集成K3）</th>
+    <th class="num">效果</th><th>对比</th></tr></thead>
+    <tbody><tr>
+<td><b>三一重工 600031</b></td>
+<td class="num down">-30.8%</td>
+<td class="num down">-24.9%</td>
+<td class="num ok"><b>缩小 5.9 pp</b></td>
+<td><div class="bar2"><div class="f1" style="width:77%">-30.8%</div>
+<div class="f2" style="width:62%">-24.9%</div></div></td></tr><tr>
+<td><b>洽洽食品 002557</b></td>
+<td class="num down">-35.4%</td>
+<td class="num down">-24.0%</td>
+<td class="num ok"><b>缩小 11.4 pp</b></td>
+<td><div class="bar2"><div class="f1" style="width:88%">-35.4%</div>
+<div class="f2" style="width:60%">-24.0%</div></div></td></tr><tr>
+<td><b>消费+蓝筹组合</b></td>
+<td class="num down">-23.3%</td>
+<td class="num down">-11.8%</td>
+<td class="num ok"><b>缩小 11.5 pp</b></td>
+<td><div class="bar2"><div class="f1" style="width:58%">-23.3%</div>
+<div class="f2" style="width:30%">-11.8%</div></div></td></tr></tbody>
+  </table>
+  <div class="hint" style="margin:12px 0 0">
+    <span style="color:#d98b8b">■</span> 不择时　<span style="color:#0a9b53">■</span> 加择时<br>
+    <b>组合上的改善最大（−23.3% → −11.8%，几乎减半）</b>。
+    因为 12 只票互相分散，择时信号不用跟单只票的特质噪声搏斗。
+  </div>
+</div>
+
+<div class="panel">
+  <h2>④ 单只票 vs 一篮子：差在哪</h2>
+  <table>
+    <thead><tr><th></th><th>单只票（三一 / 洽洽）</th><th>一篮子组合（12 选 5）</th></tr></thead>
+    <tbody>
+      <tr><td>样本外选中的策略</td>
+      <td>三一偏均线、洽洽偏动量<br><span class="mut">两个标的结论相反</span></td>
+      <td>均线 4、动量 2、不择时 2<br><span class="mut">分散，但也不集中</span></td></tr>
+      <tr><td>最差段回撤</td><td>−24% ~ −25%</td><td><b class="ok">−11.8%</b></td></tr>
+      <tr><td>择时带来的收益</td><td>三一 +23.9%（但像运气）<br>洽洽 −36.5%（还是亏）</td>
+      <td>−16.6% ~ −23.7%<br><span class="mut">比「不择时」的 −4.9% 还差</span></td></tr>
+      <tr><td>结论可信度</td><td class="bad">低：换只票结论就翻</td><td class="ok">中：回撤改善稳定复现</td></tr>
+    </tbody>
+  </table>
+  <div class="hint" style="margin:12px 0 0">
+    组合<b>没有</b>让「哪个策略最好」这个问题变简单（结论依然分散），
+    但它<b>确实</b>让最坏情况变温和了（回撤从 −24% 降到 −11.8%）。
+    这跟「别把鸡蛋放一个篮子」是同一件事。
+  </div>
+</div>
+
+<div class="warn">
+  <b>所以到底该怎么做？</b>
+  <ul>
+    <li><b>别再问「这只票适合哪个策略」。</b>三个案例说明：单只票上没有稳定答案——
+        三一偏均线、洽洽偏动量，换个标的就翻。这不是没找到，是<b>本来就不存在</b>。</li>
+    <li><b>如果目的是「少亏」，择时有用。</b>三个案例都把最差段回撤缩小了 6~12 个百分点。
+        但要接受收益会变少——组合上「一直拿着」(−4.9%) 反而最好。</li>
+    <li><b>如果目的是「多赚」，这轮数据不支持任何择时策略。</b>
+        所有「不挑尖峰」的稳健做法，三个案例里<b>没有一个是正收益</b>。</li>
+    <li><b>任何「最优参数」都要先过样本外这一关。</b>
+        本项目里判断方法很简单：看「不挑尖峰」的版本还赚不赚钱。不赚 → 那个最优就是拟合出来的。</li>
+    <li><b>组合比单只票更能扛。</b>最差段回撤 −11.8% vs −24%，差一倍。这才是分散的意义。</li>
+    <li>以上全部是历史回放，<b>不是预测、不是买卖建议</b>。</li>
+  </ul>
+</div>
+
+<div class="panel">
+  <h2>复现命令</h2>
+  <div class="hint">把 <code>--codes</code> 换成任意 6 位代码（单只）或逗号分隔的多只（组合），
+  <code>--top-n</code> 要小于票的数量。<b>两条都要跑</b>：第一条是「回头看」，第二条是「事前验证」。</div>
+  <pre style="background:#f8f9fa;padding:14px 16px;border-radius:8px;overflow-x:auto;font-size:12.5px;line-height:1.7;margin:0"><code># ① 全样本：扫 31 种择时组合
+.venv/Scripts/python.exe -m quant.main --codes 002557 --top-n 1 \
+  --use-open --rebalance M --start 20200101 --end 20260910 --benchmark "" \
+  --grid --grid-lookbacks 20 --grid-topn 1 --grid-buffers 0 \
+  --grid-timing off,ma,momentum,dual \
+  --grid-timing-lookbacks 40,60,90,120,200 --grid-timing-bands 0,0.02
+
+# ② 样本外验证：同样 31 组，切成 8 段「用前面选、在后面验」
+.venv/Scripts/python.exe -m quant.main --codes 002557 --top-n 1 \
+  --use-open --rebalance M --start 20200101 --end 20260910 --benchmark "" \
+  --walk-forward --fw-train 2 --fw-test 0.5 \
+  --grid-lookbacks 20 --grid-topn 1 --grid-buffers 0 \
+  --grid-timing off,ma,momentum,dual \
+  --grid-timing-lookbacks 40,60,90,120,200 --grid-timing-bands 0,0.02
+
+# 组合版：--codes 给多只，--top-n 给小一点
+#   --codes "002557,600519,000858,600887,603288,600031" --top-n 3</code></pre>
+</div>
+
+</div>
+</body>
+</html>
