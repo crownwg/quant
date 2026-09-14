@@ -419,7 +419,7 @@
         </div>
         <div class="field">
           <label>结束日期</label>
-          <input type="text" name="end" value="20240909" placeholder="20240909">
+          <input type="text" name="end" value="20240909" placeholder="打开页面会自动对齐到数据最新日">
         </div>
       </div>
 
@@ -737,11 +737,17 @@ fetch('/api/health').then(r => r.json()).then(h => {
 }).catch(() => { $('health').textContent = '● 服务离线'; });
 
 /* ----------- 数据体检 ----------- */
-/* 为什么值得单独做一块 UI：结束日期默认是 2024-09-09。如果用户不改它就跑
-   「生成调仓清单」，得到的是「假如当时是 2024-09-09 该买什么」——
+/* 为什么值得单独做一块 UI：结束日期这个字段如果停在旧日期就跑
+   「生成调仓清单」，得到的是「假如当时是那天该买什么」——
    回测照样跑通、清单照样漂亮，但完全不是今天的操作建议。
-   这个模块把「数据最新到哪天 / 你的结束日是不是过时了」摆在按钮旁边。 */
+   所以除了这块提示，页面首次体检还会自动把结束日对齐到数据最新日
+   （见 renderFreshness 里的 autoAligned）。 */
 let freshness = null;
+/* 首次体检自动把结束日期对齐到数据最新日，只做一次。
+   为什么不在切池子时也自动对齐：用户可能故意填历史日期做「历史回放」，
+   反复覆盖会打断他。首次对齐解决的是「打开就跑、拿到两年前清单」这个最痛的坑，
+   之后就只提示、不代劳。 */
+let autoAligned = false;
 
 async function checkFreshness() {
   const f = document.forms.runForm;
@@ -788,6 +794,16 @@ function renderFreshness(d) {
   }
   bar.className = 'freshbar ' + (d.usable ? 'ok' : 'warn');
   $('freshIcon').textContent = d.usable ? '✓' : '⚠️';
+
+  // 首次体检：结束日明显过时就自动改成数据最新日，并用新日期再体检一次。
+  // autoAligned 已置 true，所以不会递归（对齐后若仍 !usable 也不会再触发）。
+  if (!autoAligned && d.latest && !d.usable) {
+    autoAligned = true;
+    document.forms.runForm.end.value = d.latest.replace(/-/g, '');
+    checkFreshness();
+    return;
+  }
+
   // 后端文案是为终端写的，带 **加粗** 标记；网页上换成真的粗体。
   $('freshText').innerHTML =
     escapeHtml(d.message).replace(/\*\*(.+?)\*\*/g, '<b>$1</b>');
